@@ -1,0 +1,12 @@
+# ESPHome build cache / working dir
+.esphome/
+
+# Real secrets — never commit. Copy secrets.yaml.example -> secrets.yaml.
+secrets.yaml
+
+# Build artifacts
+*.bin
+
+# Python / OS cruft
+__pycache__/
+.DS_Store

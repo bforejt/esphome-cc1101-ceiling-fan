@@ -1,0 +1,545 @@
+# #############################################################################
+# ##  B99 433MHz CEILING-FAN RF BRIDGE  —  ESP32 + CC1101 (RadioLib)         ##
+# ##  Stateless transmit-only "command button" architecture                  ##
+# #############################################################################
+#
+#  Reference implementation for controlling cheap "B99" (XH-D8F8-24V-B99)
+#  433.92 MHz OOK ceiling-fan/light remotes from Home Assistant via an
+#  ESP32-S3 + CC1101 (E07-M1101D), using the RadioLib external component.
+#
+#  ---------------------------------------------------------------------------
+#  ARCHITECTURE: the ESP is a STATELESS TRANSMITTER. Each Home Assistant button
+#  maps 1:1 to a single B99 command and emits exactly that RF frame. The device
+#  tracks NO fan/light state, does no inference, and has no toggle ambiguity.
+#  All state modeling and UX logic (e.g. a single Off/Fwd-N/Rev-N control,
+#  optimistic state, presence gating) live in Home Assistant — helpers,
+#  template entities, and automations — where they can be changed without
+#  reflashing and fed by whatever context HA has. See the README for an example
+#  HA input_select + automation that turns these primitives into a single
+#  fan control with (optimistic) state.
+#
+#  Why stateless: a transmitter cannot observe the fan, so any state it claims
+#  is a guess that desyncs on power loss or use of the physical remote. Pushing
+#  state to HA keeps the firmware simple/reliable and puts the (necessarily
+#  optimistic, until RX exists) state where it can be corrected. RX decode of
+#  the physical remotes is a planned future enhancement (see README roadmap);
+#  it is intentionally NOT in this build because different fans in a home may
+#  use different carrier frequencies, so a single always-on receiver can't
+#  reliably cover them.
+#
+#  ---------------------------------------------------------------------------
+#  PROVENANCE (validated on-bench):
+#   - 32-bit frame: [20-bit ID][5-bit cmd][3-bit counter mod8][4-bit checksum].
+#     bit1 = 759us H + 243us L (3:1); bit0 = 251us H + 749us L (1:3).
+#     checksum nibble = nibble(bits11-8) ^ nibble(bits7-4) ^ K (per-unit key).
+#   - EV1527/PT2262-class framing: each frame is preceded by a SYNC header
+#     (250us H + long L gap). The fan ignores frames without it. Gap >=4000us
+#     works; 7750us (EV1527 31T) used for margin. 10 repeats per press.
+#   - TRANSMIT REQUIRES RadioLib: stock ESPHome cc1101 + remote_transmitter
+#     async-OOK TX is silently broken (ESPHome issue #16876). Drive the CC1101
+#     via github://juanboro/esphome-radiolib-cc1101 on the esp-idf framework.
+#   - SINGLE-PIN wiring: GDO0 = GPIO5 carries TX (open-drain + pullup). GDO2 is
+#     not used in this transmit-only build.
+#
+#  WIRING (ESP32-S3-DevKitM-1 <-> CC1101 E07-M1101D):
+#    GDO0->GPIO5  CSN->GPIO10  SCK->GPIO12  MOSI->GPIO11  MISO->GPIO13
+#    VCC->3V3 (NOT 5V)  GND->GND.   GDO2 unused (transmit-only).
+#
+#  ADDING A FAN: add <name>_id_dec / <name>_freq_mhz substitutions, a counter
+#  global, and a copy of the button block with that unit's id/k/freq. tx_send is
+#  generic over (unit, id, k, cmd, freq).
+#
+#  PER-UNIT FREQUENCY: tx_send tunes the CC1101 (_freq + setup_direct_mode())
+#  for the unit's frequency before each transmit, so fans on different bands
+#  share one radio. Both Office and Guest verified at 433.92 MHz.
+# #############################################################################
+
+substitutions:
+  device_name: ceiling-fan-office
+  friendly_name: "Ceiling Fan Radio"
+  pin_tx: "5"                 # GDO0 - transmit (single-pin)
+  sync_gap: "7750"            # EV1527 31T sync-gap (us); >=4000 required
+  # --- Office fan (unit 0) ---
+  office_id_dec: "953"        # 20-bit ID 0x003B9
+  office_k: "11"              # checksum key 0xB
+  office_freq_mhz: "433.92"   # verified working
+  # --- Guest fan (unit 1) ---
+  guest_id_dec: "100761"      # 20-bit ID 0x18999
+  guest_k: "10"               # checksum key 0xA
+  guest_freq_mhz: "433.92"    # verified working
+
+external_components:
+  - source: github://juanboro/esphome-radiolib-cc1101@main
+    components: [ radiolib_cc1101 ]
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-s3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret esp_433_radio__encryption_key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    on_begin:
+      - lambda: id(mycc1101).standby();
+
+web_server:
+  port: 80
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+spi:
+  clk_pin: GPIO12
+  mosi_pin: GPIO11
+  miso_pin: GPIO13
+
+# Transmit on GDO0/GPIO5. The radiolib component keys the CC1101 via the
+# remote_transmitter's on_transmit/on_complete hooks (xmit()/recv()), so the
+# radio returns to RX/idle after each transmit and does NOT hold a band keyed.
+remote_transmitter:
+  id: rf_transmitter
+  pin:
+    number: ${pin_tx}
+    mode:
+      output: true
+      input: true
+      open_drain: true
+      pullup: true
+    id: cc1101_gd0_xmit
+  carrier_duty_percent: 100%
+  on_transmit:
+    then:
+      - lambda: id(mycc1101).xmit();
+  on_complete:
+    then:
+      - lambda: id(mycc1101).recv();
+
+radiolib_cc1101:
+  id: mycc1101
+  cs_pin: GPIO10
+  bitrate: 100
+
+# The ONLY retained state: a per-unit rolling counter (mod 8). This is part of
+# the B99 PROTOCOL (the physical remotes increment it once per button press and
+# hold it constant across the ~10 repeats of that press), not UX state. Keeping
+# it makes transmissions faithful to a real remote.
+globals:
+  - id: ctr_office
+    type: uint8_t
+    restore_value: true
+    initial_value: '0'
+  - id: ctr_guest
+    type: uint8_t
+    restore_value: true
+    initial_value: '0'
+
+# -----------------------------------------------------------------------------
+# Single transmit primitive. Stateless w.r.t. fan/light; only advances the
+# protocol counter. Invoked via `script.execute:` with LITERAL ints/floats from
+# every button (no lambda-computed args -> avoids ESPHome script-arg fragility).
+#   unit : 0=office, 1=guest   (selects the per-unit counter)
+#   id_  : 20-bit fan ID    k : 4-bit checksum key    cmd : 5-bit B99 command
+#   freq : carrier frequency in MHz for THIS unit
+# Builds [SYNC + 32-bit frame] x10 as one transmit, then advances the counter.
+# -----------------------------------------------------------------------------
+script:
+  - id: tx_send
+    parameters:
+      unit: int
+      id_: int
+      k: int
+      cmd: int
+      freq: float
+    then:
+      - lambda: |-
+          // Tune the CC1101 to THIS unit's carrier frequency before transmitting.
+          id(mycc1101)._freq = freq;
+          id(mycc1101).setup_direct_mode();
+          const int MARK_1  = 759, SPACE_1 = 243;   // bit 1 (3:1)
+          const int MARK_0  = 251, SPACE_0 = 749;   // bit 0 (1:3)
+          const int SYNC_H  = 250;                  // sync header high
+          const int SYNC_L  = ${sync_gap};          // sync header low gap (us)
+          const int REPEATS = 10;
+          uint8_t cnt = (unit == 0) ? (id(ctr_office) & 0x7) : (id(ctr_guest) & 0x7);
+          // Assemble 32-bit frame: [20 id][5 cmd][3 cnt][4 checksum]
+          uint32_t v = (((uint32_t)(cmd & 0x1F)) << 7) | ((uint32_t)cnt << 4);
+          uint8_t A = (v >> 8) & 0xF;               // nibble bits 11-8
+          uint8_t B = (v >> 4) & 0xF;               // nibble bits 7-4
+          v |= (uint8_t)(A ^ B ^ (k & 0xF));        // checksum low nibble
+          uint32_t frame = (((uint32_t)(id_ & 0xFFFFF)) << 12) | v;
+          // Emit SYNC + 32 bits, repeated, as a single transmit.
+          auto call = id(rf_transmitter).transmit();
+          auto *d = call.get_data();
+          d->set_carrier_frequency(0);
+          d->reserve(REPEATS * 70 + 8);
+          for (int r = 0; r < REPEATS; r++) {
+            d->item(SYNC_H, SYNC_L);
+            for (int i = 31; i >= 0; i--) {
+              if ((frame >> i) & 0x1) d->item(MARK_1, SPACE_1);
+              else                    d->item(MARK_0, SPACE_0);
+            }
+          }
+          call.set_send_times(1);
+          call.set_send_wait(0);
+          call.perform();
+          if (unit == 0) id(ctr_office) = (cnt + 1) & 0x7;
+          else           id(ctr_guest)  = (cnt + 1) & 0x7;
+          ESP_LOGD("tx_send", "unit=%d id=0x%05X cmd=0x%02X cnt=%u freq=%.2f frame=0x%08X",
+                   unit, (unsigned)(id_ & 0xFFFFF), (unsigned)cmd,
+                   (unsigned)cnt, freq, (unsigned)frame);
+
+# -----------------------------------------------------------------------------
+# One button per B99 command, per fan. Each emits exactly one RF command.
+# Command map (5-bit, identical across all B99 units):
+#   All Off=0x06  Fan Off=0x16  Light(toggle)=0x08  Forward=0x04  Reverse=0x11
+#   Variable=0x15  Speed1=0x10 Speed2=0x12 Speed3=0x1C Speed4=0x0A Speed5=0x0F
+#   Speed6=0x0C   Timer1h=0x02  Timer2h=0x09  Timer4h=0x19
+# NOTE: Light is the ONLY true toggle in the protocol (no discrete on/off).
+# -----------------------------------------------------------------------------
+button:
+  # ============================ OFFICE (unit 0) ============================
+  - platform: template
+    name: "Office Light"
+    icon: mdi:lightbulb
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 8
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Fan Off"
+    icon: mdi:fan-off
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 22
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office All Off"
+    icon: mdi:power-off
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 6
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Forward"
+    icon: mdi:rotate-right
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 4
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Reverse"
+    icon: mdi:rotate-left
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 17
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Variable"
+    icon: mdi:fan-auto
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 21
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Speed 1"
+    icon: mdi:numeric-1-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 16
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Speed 2"
+    icon: mdi:numeric-2-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 18
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Speed 3"
+    icon: mdi:numeric-3-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 28
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Speed 4"
+    icon: mdi:numeric-4-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 10
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Speed 5"
+    icon: mdi:numeric-5-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 15
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Speed 6"
+    icon: mdi:numeric-6-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 12
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Timer 1h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 2
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Timer 2h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 9
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Timer 4h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 25
+          freq: ${office_freq_mhz}
+
+  # ============================ GUEST (unit 1) =============================
+  - platform: template
+    name: "Guest Light"
+    icon: mdi:lightbulb
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 8
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Fan Off"
+    icon: mdi:fan-off
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 22
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest All Off"
+    icon: mdi:power-off
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 6
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Forward"
+    icon: mdi:rotate-right
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 4
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Reverse"
+    icon: mdi:rotate-left
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 17
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Variable"
+    icon: mdi:fan-auto
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 21
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Speed 1"
+    icon: mdi:numeric-1-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 16
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Speed 2"
+    icon: mdi:numeric-2-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 18
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Speed 3"
+    icon: mdi:numeric-3-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 28
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Speed 4"
+    icon: mdi:numeric-4-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 10
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Speed 5"
+    icon: mdi:numeric-5-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 15
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Speed 6"
+    icon: mdi:numeric-6-box
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 12
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Timer 1h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 2
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Timer 2h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 9
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Timer 4h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 25
+          freq: ${guest_freq_mhz}
