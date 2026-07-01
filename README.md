@@ -11,8 +11,8 @@ the device (see [Architecture](#architecture-why-stateless) for why), and it doe
 
 It is the product of a long, dead-end-heavy reverse-engineering effort. The
 [What we learned](#what-we-learned-the-hard-won-part) section documents both the
-solution and the four separate things that had to be fixed to get there, plus an
-honest account of **what is proven vs. what is inferred**, so the next person
+solution and the four separate things that had to be fixed to get there, plus a
+detailed account of **what is proven vs. what is inferred**, so the next person
 doesn't repeat the loops.
 
 ---
@@ -28,7 +28,7 @@ doesn't repeat the loops.
    [RadioLib component](#dependencies), paste your ID/K/frequency into the
    `substitutions:` block of `ceiling-fan-radio.yaml`, and flash.
 
-> **Honesty note on the name.** "EV1527" here is an **inference from the
+> **Note on the name.** "EV1527" here is an **inference from the
 > signaling**, not a part number we read off the chip. We never decapped the
 > encoder. We identified the family from its behavior — the sync-header
 > requirement, the 3:1 / 1:3 OOK bit geometry, and a fixed 20-bit ID + checksum —
@@ -44,7 +44,17 @@ doesn't repeat the loops.
 |------|-----------|-------|
 | MCU | ESP32-S3-DevKitM-1 | Any ESP32 with a free SPI bus + GPIOs should work; pin numbers below are S3. |
 | Radio | CC1101 (E07-M1101D) | 433 MHz module. **Power from 3V3, never 5V.** |
-| Fan/light remote | XH-D8F8-24V-B99 | The target this was validated against. |
+| Fan fixture | [Ohniyou Cage 21-inch Flush-Mount Bladeless](https://ohniyou.com/products/ohniyou-cage-21-inch-flush-mount-bladeless-ceiling-fan-006-%E5%A4%8D%E5%88%B6-006%E5%A4%9A%E5%B1%9E%E6%80%A7-2-%E5%A4%8D%E5%88%B6) | The specific ceiling fan validated against. |
+| Fan RF receiver + remote | `XH-D8F8-24V-B99` "DC motor Control Driver" + handheld remote | The 433 MHz OOK receiver built into the fan and its stock 15-button remote — what this bridge emulates. |
+
+The **B99 receiver** is a DC-motor (ECM) fan controller wired inline between AC
+mains and the fan: a mains input, a dimmable LED **LAMP** output, a 3-phase
+**UVW** motor output, and a **433 MHz** OOK receiver on an **ANT** antenna
+terminal. Its stock **handheld remote** carries exactly the 15 buttons of the
+[command map](#command-map-5-bit-identical-across-b99-units): All Off, Light
+On/Off, F/R direction, the "natural wind" variable mode, a 1–6 speed dial with a
+Fan/Off center, and 1H/2H/4H timers — the full command set this bridge
+reproduces.
 
 ### Wiring
 
@@ -411,7 +421,7 @@ Two gotchas if you go the package route:
 
 ---
 
-## Honest summary of certainty
+## What's proven, inferred, and unknown
 
 **Proven (measured/observed on our hardware):**
 - RadioLib transmit works where the stock ESPHome component doesn't.
