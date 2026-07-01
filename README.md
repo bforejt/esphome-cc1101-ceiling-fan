@@ -1,6 +1,6 @@
 # EV1527 / B99 433 MHz Ceiling-Fan RF Bridge for Home Assistant
 
-Control cheap 433 MHz OOK ceiling-fan + light remotes (the **XH-D8F8-24V-B99**
+Control cheap 433 MHz OOK ceiling-fan + light remotes (the **XH-XXX-24V-B99**
 family and other EV1527/PT2262-class units) from Home Assistant, using an
 **ESP32-S3 + CC1101** running ESPHome with the RadioLib external component.
 
@@ -45,7 +45,7 @@ doesn't repeat the loops.
 | MCU | ESP32-S3-DevKitM-1 | Any ESP32 with a free SPI bus + GPIOs should work; pin numbers below are S3. |
 | Radio | CC1101 (E07-M1101D) | 433 MHz module. **Power from 3V3, never 5V.** |
 | Fan fixture | [Ohniyou Cage 21-inch Flush-Mount Bladeless](https://ohniyou.com/products/ohniyou-cage-21-inch-flush-mount-bladeless-ceiling-fan-006-%E5%A4%8D%E5%88%B6-006%E5%A4%9A%E5%B1%9E%E6%80%A7-2-%E5%A4%8D%E5%88%B6) | The specific ceiling fan validated against. |
-| Fan RF receiver + remote | `XH-D8F8-24V-B99` "DC motor Control Driver" + handheld remote | The 433 MHz OOK receiver built into the fan and its stock 15-button remote — what this bridge emulates. |
+| Fan RF receiver + remote | `XH-XXX-24V-B99` "DC motor Control Driver" + handheld remote | The 433 MHz OOK receiver built into the fan and its stock 15-button remote — what this bridge emulates. The middle characters of the model were illegible on our unit; the `-24V-B99` family suffix is the identifier that matters. |
 
 The **B99 receiver** is a DC-motor (ECM) fan controller wired inline between AC
 mains and the fan: a mains input, a dimmable LED **LAMP** output, a 3-phase
@@ -55,6 +55,12 @@ terminal. Its stock **handheld remote** carries exactly the 15 buttons of the
 On/Off, F/R direction, the "natural wind" variable mode, a 1–6 speed dial with a
 Fan/Off center, and 1H/2H/4H timers — the full command set this bridge
 reproduces.
+
+<p align="center">
+  <img src="images/ceiling-fan.jpg" alt="Ohniyou Cage 21-inch bladeless flush-mount ceiling fan" height="240">
+  <img src="images/b99-remote-and-controller.webp" alt="B99 DC-motor control driver and its 15-button handheld remote" height="240">
+</p>
+<p align="center"><sub>Left: the fan fixture. Right: the B99 "DC motor Control Driver" receiver (note the LAMP / UVW / ANT terminals) and its stock 15-button remote.</sub></p>
 
 ### Wiring
 
@@ -182,6 +188,11 @@ before noticing it.** If your transmissions don't actuate anything, verify the
 antenna is physically connected *before* touching anything in software. RF
 debugging order is always: **antenna first**, then modulation, then framing, then
 timing.
+
+<p align="center">
+  <img src="images/cc1101-unsoldered-antenna.jpg" alt="CC1101 E07-M1101D module with the SMA antenna connector pads unsoldered" width="300">
+</p>
+<p align="center"><sub>Our CC1101 (E07-M1101D). The SMA antenna connector's pads shipped unsoldered — about 30 dB down until repaired.</sub></p>
 
 ### Fix #2: Stock ESPHome CC1101 transmit is broken
 
