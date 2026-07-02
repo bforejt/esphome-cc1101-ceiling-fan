@@ -23,11 +23,28 @@
 #       The counter (cnt) increments by one per press, mod 8 — a nice sanity
 #       check that you're seeing distinct presses.
 #
+#  DEBUG LAYERS — three independent signals, so a silent bench run tells you
+#  exactly which layer is failing:
+#    L0  boot log: "CC1101 setup begin/end init_state =0" from
+#        radiolib_cc1101.component. Non-zero = SPI/radio init failed.
+#    L1  RSSI (tag "rssi"): logged whenever it moves >6 dB. Idle floor is
+#        typically -90s dBm; pressing the remote nearby must spike it.
+#        No spike = the radio isn't hearing (frequency/antenna/init).
+#    L2  raw pulse dumps (dump: raw, ON by default): the demodulated bit
+#        stream reaching GPIO5. RSSI spikes but no dumps = pin path problem.
+#        NOTE: with the wide-open default bandwidth, sporadic NOISE dumps
+#        with no transmission are NORMAL (per the component author) — noise
+#        proves the pin path works. Tune bandwidth/AGC to quiet it.
+#    L3  decoded frames (tag "b99_decode"): every chunk logs a DEBUG line
+#        (edge/mark counts); full frames log the INFO line with id/K.
+#        Raw dumps but no decodes = decoder/alignment — capture a raw dump
+#        and check it by hand.
+#  Once decodes flow, comment out `dump: raw` for clean logs.
+#
 #  NON-B99 REMOTES: the decoder assumes the validated B99 32-bit layout
-#  ([20 id][5 cmd][3 cnt][4 csum], short/long OOK pulse pairs). If the
-#  decoded output looks wrong or K is inconsistent, uncomment `dump: raw`
-#  below and decode by hand per the README (each HIGH mark > ~500us is a 1,
-#  else 0, 32 bits MSB-first).
+#  ([20 id][5 cmd][3 cnt][4 csum], short/long OOK pulse pairs). If K is
+#  inconsistent across presses, decode the raw dumps by hand per the README
+#  (each HIGH mark > ~500us is a 1, else 0, 32 bits MSB-first).
 #
 #  This tool also doubles as the bench feasibility check for the roadmap RX
 #  feature: it proves the same-pin (GDO0) receive path on your hardware.
@@ -79,27 +96,42 @@ spi:
   miso_pin: GPIO13
 
 # The component enters receive mode by itself at setup (setup_direct_mode()
-# ends in recv()), so no boot hook is needed. rx_pin is optional and only
-# feeds the component's RSSI sampling; the demodulated data appears on GDO0
-# by hardware configuration regardless.
+# ends in recv()), so no boot hook is needed. rx_pin is deliberately NOT set:
+# it only feeds the component's opportunistic RSSI sampling (we read RSSI over
+# SPI ourselves below), and leaving it out guarantees nothing but the
+# remote_receiver's RMT channel ever touches GPIO5. The demodulated data
+# appears on GDO0 by CC1101 register configuration regardless (RadioLib
+# directMode async: IOCFG0 = serial data out).
 radiolib_cc1101:
   id: mycc1101
   cs_pin: GPIO10
   frequency: ${listen_freq}
   modulation: OOK              # explicit for documentation (also the default)
-  filter: 464kHz               # RX bandwidth (component default; 58-812kHz)
+  filter: 464kHz               # RX bandwidth (component default; 58-812kHz).
+                               # Wide-open = max capture odds but more noise;
+                               # narrow toward 102-232kHz to quiet noise dumps.
   bitrate: 10                  # RX sampling ~100us resolution — cleanly separates
                                # the ~250us and ~760us marks with less noise than
                                # higher rates (component author's RX example value)
-  rx_pin:
-    number: ${pin_rx}
-    allow_other_uses: true     # remote_receiver reads the same GPIO below
+
+# L1: RSSI watcher — logs only on >6 dB movement, so it's quiet at the idle
+# floor and fires when you press the remote nearby. SPI register read; does
+# not touch GPIO5.
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          static float last_logged = -999.0f;
+          const float r = id(mycc1101).getRSSI();
+          if (r - last_logged > 6.0f || last_logged - r > 6.0f) {
+            ESP_LOGI("rssi", "%.0f dBm", r);
+            last_logged = r;
+          }
 
 remote_receiver:
   id: rf_receiver
   pin:
     number: ${pin_rx}
-    allow_other_uses: true
     mode:
       input: true
       pullup: true
@@ -112,33 +144,46 @@ remote_receiver:
   filter: 120us                # reject sub-bit noise glitches
   buffer_size: 10kb
   tolerance: 35%
-  # Uncomment for raw pulse lists (hand-decoding unknown protocols); noisy.
-  # dump: raw
+  # L2: raw pulse dumps — ON by default so you can SEE what reaches the pin.
+  # Sporadic noise dumps with no transmission are normal (wide-open RX).
+  # Comment out once b99_decode lines are flowing.
+  dump: raw
   on_raw:
     - lambda: |-
-        // Decode one B99/EV1527 frame from a capture chunk. Chunk anatomy:
-        // the sync gap (~7750us low) exceeds idle, so each chunk is
-        // [32 bit marks/spaces][next repeat's 250us sync mark] — the first
-        // 32 marks ARE the frame, MSB first. Sync-only chunks are skipped.
+        // L3: decode one B99/EV1527 frame from a capture chunk. Chunk
+        // anatomy: the sync gap (~7750us low) exceeds idle, so a clean chunk
+        // is [32 bit marks/spaces][next repeat's 250us sync mark], MSB
+        // first. Noise can prepend slivers, so scan for the first window of
+        // 32 consecutive bit-shaped marks rather than requiring alignment.
         std::vector<int32_t> marks;
         for (int32_t v : x)
           if (v > 0) marks.push_back(v);
-        if (marks.size() < 32) return;   // sync-only chunk or noise
-        uint32_t frame = 0;
-        for (int i = 0; i < 32; i++) {
-          if (marks[i] < 100 || marks[i] > 1000) return;  // not bit-shaped: skip chunk
-          frame = (frame << 1) | (marks[i] > 500 ? 1u : 0u);
+        ESP_LOGD("b99_decode", "chunk: %u edges, %u marks",
+                 (unsigned) x.size(), (unsigned) marks.size());
+        if (marks.size() < 32) return;   // sync-only chunk or noise sliver
+        const int n = (int) marks.size();
+        for (int s = 0; s + 32 <= n; s++) {
+          uint32_t frame = 0;
+          bool ok = true;
+          for (int i = 0; i < 32; i++) {
+            const int32_t m = marks[s + i];
+            if (m < 100 || m > 1000) { ok = false; break; }  // not bit-shaped
+            frame = (frame << 1) | (m > 500 ? 1u : 0u);
+          }
+          if (!ok) continue;
+          const uint32_t rid  = frame >> 12;          // 20-bit remote ID
+          const uint8_t  cmd  = (frame >> 7) & 0x1F;  // 5-bit command
+          const uint8_t  cnt  = (frame >> 4) & 0x7;   // 3-bit rolling counter
+          const uint8_t  csum = frame & 0xF;          // 4-bit checksum
+          // checksum = nibble(bits11-8) ^ nibble(bits7-4) ^ K => solve for K
+          const uint8_t  A = (frame >> 8) & 0xF;
+          const uint8_t  B = (frame >> 4) & 0xF;
+          const uint8_t  K = A ^ B ^ csum;
+          ESP_LOGI("b99_decode",
+                   "frame=0x%08X id=0x%05X (%u) cmd=0x%02X cnt=%u csum=0x%X -> K=0x%X (%u) rssi=%.0fdBm%s",
+                   (unsigned) frame, (unsigned) rid, (unsigned) rid,
+                   (unsigned) cmd, (unsigned) cnt, (unsigned) csum,
+                   (unsigned) K, (unsigned) K, id(mycc1101).getRSSI(),
+                   s == 0 ? "" : " (offset-aligned)");
+          return;
         }
-        const uint32_t rid  = frame >> 12;          // 20-bit remote ID
-        const uint8_t  cmd  = (frame >> 7) & 0x1F;  // 5-bit command
-        const uint8_t  cnt  = (frame >> 4) & 0x7;   // 3-bit rolling counter
-        const uint8_t  csum = frame & 0xF;          // 4-bit checksum
-        // checksum = nibble(bits11-8) ^ nibble(bits7-4) ^ K  =>  solve for K
-        const uint8_t  A = (frame >> 8) & 0xF;
-        const uint8_t  B = (frame >> 4) & 0xF;
-        const uint8_t  K = A ^ B ^ csum;
-        ESP_LOGI("b99_decode",
-                 "frame=0x%08X id=0x%05X (%u) cmd=0x%02X cnt=%u csum=0x%X -> K=0x%X (%u) rssi=%.0fdBm",
-                 (unsigned) frame, (unsigned) rid, (unsigned) rid,
-                 (unsigned) cmd, (unsigned) cnt, (unsigned) csum,
-                 (unsigned) K, (unsigned) K, id(mycc1101).getRSSI());

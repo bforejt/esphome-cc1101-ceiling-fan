@@ -440,8 +440,9 @@ the listener uses the exact bridge wiring — GDO2 stays unconnected.
    increment by one per press, mod 8.
 4. Copy the decimal `id` and `K` into your bridge variant's `substitutions:`.
 
-If your remote is **not** a B99 (decodes look wrong, `K` inconsistent),
-uncomment `dump: raw` in the listener and decode by hand: each **mark**
+If your remote is **not** a B99 (decodes look wrong, `K` inconsistent), use
+the listener's raw pulse dumps (`dump: raw`, on by default) and decode by
+hand: each **mark**
 (HIGH) > ~500 µs is a `1`, else `0`; assemble 32 bits MSB-first, then split
 per the [frame layout](#the-protocol-validated). The repeats are noisy at the
 edges — look for the cleanest 32-mark frame.
