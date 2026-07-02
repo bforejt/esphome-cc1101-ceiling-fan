@@ -101,9 +101,10 @@ GND    ───────►   GND
 GDO2              (unused in this transmit-only build)
 ```
 
-If you also want to *receive* the remotes for your own decoding work, GDO2→GPIO6
-is a reasonable dedicated RX pin (see [Capturing](#capturing--decoding-your-remote)),
-but the shipped bridge does not use it.
+Receive needs **no extra wiring**: in receive mode the CC1101 outputs
+demodulated data on the same GDO0 pin, which is how the shipped
+`ceiling-fan-listener.yaml` capture tool works (see
+[Capturing](#capturing--decoding-your-remote)). GDO2 stays unconnected.
 
 ---
 
@@ -125,6 +126,7 @@ but the shipped bridge does not use it.
 |------|------|
 | `ceiling-fan-radio.yaml` | The **stateless** variant: two fans (Office, Guest) as repeated button blocks sharing one transmit engine. The minimal reference — also the protocol-provenance record. |
 | `ceiling-fan-entity.yaml` | The **stateful** variant: native fan + light entities per fan, on-device assumed state, same transmit engine. See [The stateful variant](#the-stateful-variant). |
+| `ceiling-fan-listener.yaml` | **Capture tool**, not a bridge: receive-only config that decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. Flash temporarily to extract your remote's values. See [Method A](#method-a--flash-the-shipped-listener-no-extra-hardware-no-rewiring). |
 
 > Both configs are intentionally **single readable flat files** with some
 > repetition between fans, rather than clever multi-file packages. See
@@ -418,38 +420,39 @@ If it doesn't match, stop here; this won't work without re-deriving the protocol
 You need your remote's **20-bit ID** and **checksum key `K`**. Two capture methods
 worked for us.
 
-### Method A — CC1101 in receive mode (no extra hardware)
+### Method A — flash the shipped listener (no extra hardware, no rewiring)
 
-Since you're already building a CC1101 rig, you can use it to *receive*. Put the
-CC1101's RX data on a dedicated pin (GDO2 → GPIO6) and run a `remote_receiver` with
-raw dumping:
+The repo ships `ceiling-fan-listener.yaml`: a receive-only config that decodes
+B99 frames off the air and logs your remote's values directly. The CC1101
+outputs demodulated RX data on the **same GDO0 pin** it takes TX data on, so
+the listener uses the exact bridge wiring — GDO2 stays unconnected.
 
-```yaml
-remote_receiver:
-  id: rf_receiver
-  pin:
-    number: GPIO6
-    mode: { input: true, pullup: true }
-  # idle MUST be shorter than the inter-frame sync gap (≈7750 µs) but longer than
-  # the longest within-frame space (≈750 µs), or all repeats merge into one
-  # oversized capture and the RMT buffer overflows. ~5500 µs works.
-  idle: 5500us
-  filter: 120us       # reject sub-bit noise glitches
-  buffer_size: 10kb
-  tolerance: 35%
-  dump: raw
-```
+1. Flash `ceiling-fan-listener.yaml` (temporarily — reflash your bridge
+   variant afterwards) and stream logs.
+2. Press a remote button near the antenna. Each press produces ~10 decoded
+   lines (one per RF repeat) tagged `b99_decode`:
+   ```
+   frame=0x003B940F id=0x003B9 (953) cmd=0x08 cnt=0 csum=0xF -> K=0xB (11)
+   ```
+   Identical repeats are your confidence signal.
+3. Press several **different** buttons: `K` must come out the same every time
+   (it's a per-remote constant — see [Finding K](#finding-k)); `cnt` should
+   increment by one per press, mod 8.
+4. Copy the decimal `id` and `K` into your bridge variant's `substitutions:`.
 
-> **Gotcha we hit (documented so you don't):** if `idle` is set *longer* than the
-> sync gap, every repeat concatenates into a single capture that overflows the
-> buffer — you'll see a flood of `Buffer overflow` and **zero** decoded frames.
-> That flood means the radio *is hearing the remote* — it's a frame-delimiting
-> problem, not a reception failure. Lower `idle` below the sync gap.
-
-Press a button near the device, read the raw pulse list from the logs, and decode:
-each **mark** (HIGH) > ~500 µs is a `1`, else `0`; assemble 32 bits MSB-first, then
-split per the [frame layout](#the-protocol-validated). The repeats are noisy at the
+If your remote is **not** a B99 (decodes look wrong, `K` inconsistent),
+uncomment `dump: raw` in the listener and decode by hand: each **mark**
+(HIGH) > ~500 µs is a `1`, else `0`; assemble 32 bits MSB-first, then split
+per the [frame layout](#the-protocol-validated). The repeats are noisy at the
 edges — look for the cleanest 32-mark frame.
+
+> **Gotcha we hit (documented so you don't):** the receiver's `idle` must be
+> *shorter* than the ≈7750 µs inter-frame sync gap but *longer* than the
+> longest within-frame space (≈750 µs) — the listener ships 5500 µs. If
+> `idle` exceeds the sync gap, every repeat concatenates into one oversized
+> capture that overflows the buffer: you'll see a flood of `Buffer overflow`
+> and **zero** decoded frames. That flood means the radio *is hearing the
+> remote* — it's a frame-delimiting problem, not a reception failure.
 
 ### Method B — RTL-SDR + Universal Radio Hacker (URH)
 
@@ -503,9 +506,11 @@ Two gotchas if you go the package route:
   gating, a suppressed state-sync path (the All Off pattern *is* the future RX
   handler pattern), a counter-based press-dedup plan, a pinned component
   commit, and a commented-out same-pin `remote_receiver` block (the component's
-  own examples share GDO0 for TX and RX — no rewiring expected). Still deferred
-  pending bench validation. The radio parks in RX/idle between transmits so it
-  doesn't hold a band keyed.
+  own examples share GDO0 for TX and RX — no rewiring expected). The
+  `ceiling-fan-listener.yaml` capture tool exercises exactly this receive path,
+  so running it doubles as the feasibility check. Still deferred pending bench
+  validation. The radio parks in RX/idle between transmits so it doesn't hold
+  a band keyed.
 - **The light is toggle-only.** No amount of work makes light state authoritative
   without RX feedback, and even with RX it self-heals only on the next press. Plan
   HA-side light state as optimistic.
