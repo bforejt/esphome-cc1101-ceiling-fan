@@ -69,7 +69,9 @@ substitutions:
   guest_freq_mhz: "433.92"    # verified working
 
 external_components:
-  - source: github://juanboro/esphome-radiolib-cc1101@main
+  # Pinned commit (repo has no tags) — keeps both repo variants building the
+  # same, known-good component source.
+  - source: github://juanboro/esphome-radiolib-cc1101@b79b8552d09682da561d8ff9b4b71ccea9b75f1b
     components: [ radiolib_cc1101 ]
 
 esphome:

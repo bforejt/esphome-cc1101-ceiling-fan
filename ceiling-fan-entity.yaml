@@ -1,0 +1,650 @@
+# #############################################################################
+# ##  B99 433MHz CEILING-FAN RF BRIDGE  —  ESP32 + CC1101 (RadioLib)         ##
+# ##  STATEFUL "fan entity" variant — on-device assumed state               ##
+# #############################################################################
+#
+#  The stateful counterpart to ceiling-fan-radio.yaml (the stateless button
+#  bridge). Same hardware, same bench-proven RF engine — but each fan is a
+#  native ESPHome FAN entity (on/off, 6 speeds, direction, "Breeze" preset)
+#  plus a LIGHT entity, with assumed state retained on the device and restored
+#  from flash across reboots. Flash ONE variant per board; switching variants
+#  creates a new device in Home Assistant (delete the stale one).
+#
+#  ---------------------------------------------------------------------------
+#  ARCHITECTURE: single ON_STATE RECONCILER per fan. All transmit logic lives
+#  in one on_state lambda that diffs the entity's commanded state against the
+#  assumed-physical-state globals and transmits only the differences. This is
+#  order-independent (it doesn't matter what a FanCall bundles), idempotent
+#  (a second pass diffs nothing), and is the exact seam a future RX decoder
+#  reuses (RX = update globals + entity under suppress; reconciler sees no
+#  diff). We deliberately do NOT use on_turn_on/on_speed_set/on_direction_set:
+#  their relative firing order for combined calls is not contractually
+#  documented, and ESPHome has no side-effect-free publish_state for fans.
+#
+#  SUPPRESS GUARD: `suppress_tx` boots TRUE every boot (not restored), so
+#  nothing transmitted during component setup/restore can reach the air. The
+#  on_boot hook (priority -100) pushes flash-restored globals into the
+#  entities (suppressed), then arms transmit as its last statement. The same
+#  guard scopes every programmatic state sync (All Off, invert button, and
+#  future RX) — trigger callbacks run synchronously inside perform(), so a
+#  set/clear pair inside one lambda brackets them.
+#
+#  HONESTY OF "ASSUMED" STATE: a transmitter cannot observe the fan. This
+#  variant *chooses* to track optimistic state anyway (that's its point);
+#  known desync paths and their remedies:
+#    - Light is a protocol-level TOGGLE (no discrete on/off). If it drifts,
+#      the "Light State Invert" diagnostic button flips the assumption
+#      without transmitting.
+#    - Timer buttons (1h/2h/4h) transmit fire-and-forget; when the fan's
+#      timer fires, the fan entity shows on until the next command. By design
+#      (timer-cancellation semantics are unverified).
+#    - "All Off" transmits the atomic 0x06 frame and force-syncs fan+light
+#      to off — it IS the manual resync-to-known-state affordance.
+#    - Fan power cycle desyncs everything until the next command. Unavoidable
+#      without RX; RX (roadmap) heals fan state on the next remote press.
+#    - Direction set while the fan is OFF is NOT transmitted (whether F/R
+#      starts a stopped fan is unverified); it displays immediately and is
+#      applied on the next turn-on as [Speed N, then F/R], queued ~450ms
+#      apart.
+#
+#  PROVENANCE: protocol, timings, wiring, and the four hard-won fixes are
+#  documented in ceiling-fan-radio.yaml and the README. The tx_send frame
+#  builder below is copied VERBATIM from the bench-proven original; only its
+#  script mode (queued) and a pacing delay are new.
+#
+#  WIRING (ESP32-S3-DevKitM-1 <-> CC1101 E07-M1101D):
+#    GDO0->GPIO5  CSN->GPIO10  SCK->GPIO12  MOSI->GPIO11  MISO->GPIO13
+#    VCC->3V3 (NOT 5V)  GND->GND.   GDO2 unused (transmit-only).
+#
+#  PHASE 2 (RX) SEAMS, built now:
+#    - radio_txing flag (set on_transmit / cleared on_complete) for the RX
+#      handler to gate out self-echo — the shared GDO0 pin toggles with our
+#      own bit stream during TX and the component does not suppress it.
+#    - The suppressed state-sync path (see All Off) is exactly the RX
+#      handler pattern: decode -> set globals -> push entity state under
+#      suppress_tx.
+#    - RX dedup plan: physical remotes hold the 3-bit counter constant
+#      across the ~10 repeats of one press, so a decoded frame whose
+#      (ID, cmd, counter) tuple equals the last-seen tuple within a short
+#      window is the same press. One uint32 last_rx_frame global suffices.
+#    - Same-pin RX wiring: the component's own examples put rx_pin +
+#      remote_receiver + remote_transmitter ALL on GDO0 with
+#      allow_other_uses: true — no rewiring. See the commented block at the
+#      bottom of this file.
+#    - Component pinned to a verified commit (below) so RX lands against a
+#      known API (_freq, setup_direct_mode, xmit, recv, standby, set_rx_pin).
+# #############################################################################
+
+substitutions:
+  device_name: ceiling-fan-entity
+  friendly_name: "Ceiling Fan Entity"
+  pin_tx: "5"                 # GDO0 - transmit (single-pin)
+  sync_gap: "7750"            # EV1527 31T sync-gap (us); >=4000 required
+  tx_pace: "450ms"            # >= RF airtime per command: 10 repeats x (~8ms sync + 32 x ~1ms) ~= 400ms
+  # --- Office fan (unit 0) ---
+  office_id_dec: "953"        # 20-bit ID 0x003B9
+  office_k: "11"              # checksum key 0xB
+  office_freq_mhz: "433.92"   # verified working
+  # --- Guest fan (unit 1) ---
+  guest_id_dec: "100761"      # 20-bit ID 0x18999
+  guest_k: "10"               # checksum key 0xA
+  guest_freq_mhz: "433.92"    # verified working
+
+external_components:
+  # Pinned commit (repo has no tags). Verified to expose the API we use:
+  # _freq, setup_direct_mode(), xmit(), recv(), standby(), set_rx_pin.
+  - source: github://juanboro/esphome-radiolib-cc1101@b79b8552d09682da561d8ff9b4b71ccea9b75f1b
+    components: [ radiolib_cc1101 ]
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  # Boot sync: push flash-restored assumed state into the entities WITHOUT
+  # transmitting, then arm TX. suppress_tx boots true, so anything fired
+  # earlier during component setup/restore is inert too (defense #1); this
+  # hook is defense #3. Priority -100 = after all components are set up.
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          {  // Office fan
+            auto call = id(office_fan).make_call();
+            call.set_state(id(office_fan_on));
+            call.set_direction(id(office_fan_fwd) ? fan::FanDirection::FORWARD
+                                                  : fan::FanDirection::REVERSE);
+            if (id(office_fan_on)) {
+              if (id(office_fan_breeze)) call.set_preset_mode("Breeze");
+              else call.set_speed(id(office_fan_speed));
+            }
+            call.perform();  // fires on_state -> suppressed no-op
+          }
+          {  // Guest fan
+            auto call = id(guest_fan).make_call();
+            call.set_state(id(guest_fan_on));
+            call.set_direction(id(guest_fan_fwd) ? fan::FanDirection::FORWARD
+                                                 : fan::FanDirection::REVERSE);
+            if (id(guest_fan_on)) {
+              if (id(guest_fan_breeze)) call.set_preset_mode("Breeze");
+              else call.set_speed(id(guest_fan_speed));
+            }
+            call.perform();
+          }
+          // Lights: align entities to assumed state (write_action suppressed).
+          if (id(office_light_on)) id(office_light).turn_on().perform();
+          else                     id(office_light).turn_off().perform();
+          if (id(guest_light_on))  id(guest_light).turn_on().perform();
+          else                     id(guest_light).turn_off().perform();
+          // ARM transmit — must be the last statement of the boot sync.
+          id(suppress_tx) = false;
+
+# Assumed state changes a few times a day; 10s batching means a power cut
+# loses at most 10s of history while keeping NVS wear negligible.
+preferences:
+  flash_write_interval: 10s
+
+esp32:
+  board: esp32-s3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret esp_433_radio__encryption_key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    on_begin:
+      - lambda: id(mycc1101).standby();
+
+web_server:
+  port: 80
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+spi:
+  clk_pin: GPIO12
+  mosi_pin: GPIO11
+  miso_pin: GPIO13
+
+# Transmit on GDO0/GPIO5. The radiolib component keys the CC1101 via the
+# remote_transmitter's on_transmit/on_complete hooks (xmit()/recv()), so the
+# radio returns to RX/idle after each transmit and does NOT hold a band keyed.
+# radio_txing brackets each transmission — the Phase-2 RX handler gates on it
+# to ignore self-echo on the shared pin.
+remote_transmitter:
+  id: rf_transmitter
+  pin:
+    number: ${pin_tx}
+    mode:
+      output: true
+      input: true
+      open_drain: true
+      pullup: true
+    id: cc1101_gd0_xmit
+  carrier_duty_percent: 100%
+  on_transmit:
+    then:
+      - lambda: |-
+          id(radio_txing) = true;
+          id(mycc1101).xmit();
+  on_complete:
+    then:
+      - lambda: |-
+          id(mycc1101).recv();
+          id(radio_txing) = false;
+
+radiolib_cc1101:
+  id: mycc1101
+  cs_pin: GPIO10
+  bitrate: 100
+  # PHASE 2 (RX): add rx_pin on the SAME GPIO as TX (component examples do
+  # exactly this) — no rewiring:
+  #   rx_pin:
+  #     number: ${pin_tx}
+  #     allow_other_uses: true
+
+globals:
+  # --- Protocol counters (unchanged from the radio variant; part of the RF
+  # --- protocol, not UX state) ---
+  - id: ctr_office
+    type: uint8_t
+    restore_value: true
+    initial_value: '0'
+  - id: ctr_guest
+    type: uint8_t
+    restore_value: true
+    initial_value: '0'
+  # --- Assumed physical state, Office (flash-restored source of truth; the
+  # --- fan entity itself uses restore_mode: NO_RESTORE because template-fan
+  # --- restore is unreliable on esp-idf) ---
+  - id: office_fan_on
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: office_fan_speed        # last FIXED speed (1..6, never 0); survives off/breeze
+    type: uint8_t
+    restore_value: true
+    initial_value: '3'
+  - id: office_fan_fwd          # assumed PHYSICAL direction (true = forward)
+    type: bool
+    restore_value: true
+    initial_value: 'true'
+  - id: office_fan_breeze
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: office_light_on         # assumed light state (the protocol only has toggle)
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  # --- Assumed physical state, Guest ---
+  - id: guest_fan_on
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: guest_fan_speed
+    type: uint8_t
+    restore_value: true
+    initial_value: '3'
+  - id: guest_fan_fwd
+    type: bool
+    restore_value: true
+    initial_value: 'true'
+  - id: guest_fan_breeze
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: guest_light_on
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  # --- Guards (never restored) ---
+  - id: suppress_tx             # boots TRUE: boot guard + programmatic-sync guard
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+  - id: radio_txing             # Phase-2 self-echo seam (set/cleared by TX hooks)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+# -----------------------------------------------------------------------------
+# Single transmit primitive — frame builder copied VERBATIM from the
+# bench-proven radio variant. New here: mode: queued serializes overlapping
+# executes (slider drags, [Speed, F/R] sequences, both fans at once) and keeps
+# the per-unit retune from firing mid-transmission; the trailing delay holds
+# each run active for the full RF airtime.
+#   unit : 0=office, 1=guest   (selects the per-unit counter)
+#   id_  : 20-bit fan ID    k : 4-bit checksum key    cmd : 5-bit B99 command
+#   freq : carrier frequency in MHz for THIS unit
+# -----------------------------------------------------------------------------
+script:
+  - id: tx_send
+    mode: queued
+    max_runs: 10
+    parameters:
+      unit: int
+      id_: int
+      k: int
+      cmd: int
+      freq: float
+    then:
+      - lambda: |-
+          // Tune the CC1101 to THIS unit's carrier frequency before transmitting.
+          id(mycc1101)._freq = freq;
+          id(mycc1101).setup_direct_mode();
+          const int MARK_1  = 759, SPACE_1 = 243;   // bit 1 (3:1)
+          const int MARK_0  = 251, SPACE_0 = 749;   // bit 0 (1:3)
+          const int SYNC_H  = 250;                  // sync header high
+          const int SYNC_L  = ${sync_gap};          // sync header low gap (us)
+          const int REPEATS = 10;
+          uint8_t cnt = (unit == 0) ? (id(ctr_office) & 0x7) : (id(ctr_guest) & 0x7);
+          // Assemble 32-bit frame: [20 id][5 cmd][3 cnt][4 checksum]
+          uint32_t v = (((uint32_t)(cmd & 0x1F)) << 7) | ((uint32_t)cnt << 4);
+          uint8_t A = (v >> 8) & 0xF;               // nibble bits 11-8
+          uint8_t B = (v >> 4) & 0xF;               // nibble bits 7-4
+          v |= (uint8_t)(A ^ B ^ (k & 0xF));        // checksum low nibble
+          uint32_t frame = (((uint32_t)(id_ & 0xFFFFF)) << 12) | v;
+          // Emit SYNC + 32 bits, repeated, as a single transmit.
+          auto call = id(rf_transmitter).transmit();
+          auto *d = call.get_data();
+          d->set_carrier_frequency(0);
+          d->reserve(REPEATS * 70 + 8);
+          for (int r = 0; r < REPEATS; r++) {
+            d->item(SYNC_H, SYNC_L);
+            for (int i = 31; i >= 0; i--) {
+              if ((frame >> i) & 0x1) d->item(MARK_1, SPACE_1);
+              else                    d->item(MARK_0, SPACE_0);
+            }
+          }
+          call.set_send_times(1);
+          call.set_send_wait(0);
+          call.perform();
+          if (unit == 0) id(ctr_office) = (cnt + 1) & 0x7;
+          else           id(ctr_guest)  = (cnt + 1) & 0x7;
+          ESP_LOGD("tx_send", "unit=%d id=0x%05X cmd=0x%02X cnt=%u freq=%.2f frame=0x%08X",
+                   unit, (unsigned)(id_ & 0xFFFFF), (unsigned)cmd,
+                   (unsigned)cnt, freq, (unsigned)frame);
+      - delay: ${tx_pace}
+
+# -----------------------------------------------------------------------------
+# FAN ENTITIES — one on_state reconciler each (see header). Command map used:
+#   Fan Off=0x16  Forward=0x04  Reverse=0x11  Variable/Breeze=0x15
+#   Speed1..6 = 0x10 0x12 0x1C 0x0A 0x0F 0x0C   (absolute; Speed N is also
+#   the turn-on command — bench-verify item A)
+# -----------------------------------------------------------------------------
+fan:
+  - platform: template
+    id: office_fan
+    name: "Office Fan"
+    speed_count: 6
+    has_direction: true
+    preset_modes:
+      - "Breeze"
+    restore_mode: NO_RESTORE   # globals are the source of truth (see on_boot)
+    on_state:
+      - lambda: |-
+          if (id(suppress_tx)) return;   // boot restore / All Off / Phase-2 RX sync
+          auto *f = id(office_fan);
+          const bool want_on  = f->state;
+          // "Breeze" is the only preset, so any active preset means Breeze.
+          const bool want_brz = want_on && f->has_preset_mode();
+          const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
+          int want_spd = f->speed;
+          if (want_spd < 1 || want_spd > 6) want_spd = id(office_fan_speed);  // turn-on w/o pct -> last speed
+          static const uint8_t SPD_CMD[7] = {0, 0x10, 0x12, 0x1C, 0x0A, 0x0F, 0x0C};
+
+          // 1) OFF (direction flips while off are NOT transmitted — deferred
+          //    to the next turn-on; see header)
+          if (!want_on) {
+            if (id(office_fan_on)) {
+              id(tx_send).execute(0, ${office_id_dec}, ${office_k}, 0x16, ${office_freq_mhz});
+              id(office_fan_on) = false;
+              id(office_fan_breeze) = false;   // fan stop clears breeze physically
+            }
+            return;
+          }
+          // 2) Breeze preset (Variable 0x15); fixed-speed global intentionally untouched
+          if (want_brz) {
+            if (!id(office_fan_breeze) || !id(office_fan_on)) {
+              id(tx_send).execute(0, ${office_id_dec}, ${office_k}, 0x15, ${office_freq_mhz});
+              id(office_fan_on) = true;
+              id(office_fan_breeze) = true;
+            }
+          }
+          // 3) Fixed speed — absolute; doubles as turn-on and as breeze-exit
+          else if (!id(office_fan_on) || id(office_fan_breeze) || want_spd != (int) id(office_fan_speed)) {
+            id(tx_send).execute(0, ${office_id_dec}, ${office_k}, SPD_CMD[want_spd], ${office_freq_mhz});
+            id(office_fan_on) = true;
+            id(office_fan_breeze) = false;
+            id(office_fan_speed) = want_spd;
+          }
+          // 4) Direction — F/R preserves speed (validated); only TX while on.
+          //    Runs after 3, so a deferred off-state flip settles as
+          //    [Speed N, then F/R], serialized by the queued tx_send.
+          if (want_fwd != id(office_fan_fwd)) {
+            id(tx_send).execute(0, ${office_id_dec}, ${office_k}, want_fwd ? 0x04 : 0x11, ${office_freq_mhz});
+            id(office_fan_fwd) = want_fwd;
+          }
+
+  - platform: template
+    id: guest_fan
+    name: "Guest Fan"
+    speed_count: 6
+    has_direction: true
+    preset_modes:
+      - "Breeze"
+    restore_mode: NO_RESTORE
+    on_state:
+      - lambda: |-
+          if (id(suppress_tx)) return;
+          auto *f = id(guest_fan);
+          const bool want_on  = f->state;
+          const bool want_brz = want_on && f->has_preset_mode();
+          const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
+          int want_spd = f->speed;
+          if (want_spd < 1 || want_spd > 6) want_spd = id(guest_fan_speed);
+          static const uint8_t SPD_CMD[7] = {0, 0x10, 0x12, 0x1C, 0x0A, 0x0F, 0x0C};
+
+          if (!want_on) {
+            if (id(guest_fan_on)) {
+              id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, 0x16, ${guest_freq_mhz});
+              id(guest_fan_on) = false;
+              id(guest_fan_breeze) = false;
+            }
+            return;
+          }
+          if (want_brz) {
+            if (!id(guest_fan_breeze) || !id(guest_fan_on)) {
+              id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, 0x15, ${guest_freq_mhz});
+              id(guest_fan_on) = true;
+              id(guest_fan_breeze) = true;
+            }
+          }
+          else if (!id(guest_fan_on) || id(guest_fan_breeze) || want_spd != (int) id(guest_fan_speed)) {
+            id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, SPD_CMD[want_spd], ${guest_freq_mhz});
+            id(guest_fan_on) = true;
+            id(guest_fan_breeze) = false;
+            id(guest_fan_speed) = want_spd;
+          }
+          if (want_fwd != id(guest_fan_fwd)) {
+            id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, want_fwd ? 0x04 : 0x11, ${guest_freq_mhz});
+            id(guest_fan_fwd) = want_fwd;
+          }
+
+# -----------------------------------------------------------------------------
+# LIGHTS — binary light over a template output implementing toggle-on-
+# difference: the RF Light command (0x08) is a pure toggle, so we transmit
+# only when the commanded state differs from the assumed state.
+# -----------------------------------------------------------------------------
+output:
+  - platform: template
+    id: office_light_out
+    type: binary
+    write_action:
+      - lambda: |-
+          if (id(suppress_tx)) return;              // boot restore / All Off / invert / RX sync
+          if (state == id(office_light_on)) return; // already there — no RF
+          id(tx_send).execute(0, ${office_id_dec}, ${office_k}, 0x08, ${office_freq_mhz});
+          id(office_light_on) = state;
+  - platform: template
+    id: guest_light_out
+    type: binary
+    write_action:
+      - lambda: |-
+          if (id(suppress_tx)) return;
+          if (state == id(guest_light_on)) return;
+          id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, 0x08, ${guest_freq_mhz});
+          id(guest_light_on) = state;
+
+light:
+  - platform: binary
+    id: office_light
+    name: "Office Light"
+    output: office_light_out
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: binary
+    id: guest_light
+    name: "Guest Light"
+    output: guest_light_out
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# -----------------------------------------------------------------------------
+# RAW BUTTONS. Rule: raw buttons never route through entity calls; each owns
+# its state consequences explicitly.
+#   - Timers: fire-and-forget TX, touch NO state (entity desyncs when the
+#     fan's timer fires — documented).
+#   - All Off: atomic 0x06 (kills fan+light regardless of assumed state —
+#     which is exactly why it is NOT an entity call: an entity-driven light
+#     TOGGLE is wrong precisely when state has drifted), then force-sync both
+#     entities to off under the suppress guard. THE resync affordance.
+#   - Light State Invert (diagnostic): no RF; flips the assumed light state
+#     for one-press recovery when the toggle-only light drifts.
+# -----------------------------------------------------------------------------
+button:
+  # ============================ OFFICE (unit 0) ============================
+  - platform: template
+    name: "Office Timer 1h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 2
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Timer 2h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 9
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office Timer 4h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 25
+          freq: ${office_freq_mhz}
+  - platform: template
+    name: "Office All Off"
+    icon: mdi:power-off
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 0
+          id_: ${office_id_dec}
+          k: ${office_k}
+          cmd: 6
+          freq: ${office_freq_mhz}
+      - lambda: |-
+          // Force-sync assumed + entity state to off. Triggers fired by the
+          // perform() calls run synchronously, so the suppress pair brackets
+          // them (bench-verify: All Off log trace shows exactly one tx_send).
+          id(suppress_tx) = true;
+          id(office_fan_on) = false;
+          id(office_fan_breeze) = false;
+          id(office_light_on) = false;
+          id(office_fan).turn_off().perform();
+          id(office_light).turn_off().perform();
+          id(suppress_tx) = false;
+  - platform: template
+    name: "Office Light State Invert"
+    icon: mdi:lightbulb-question
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          // No RF — flip the assumption and mirror it to the entity.
+          id(suppress_tx) = true;
+          id(office_light_on) = !id(office_light_on);
+          if (id(office_light_on)) id(office_light).turn_on().perform();
+          else                     id(office_light).turn_off().perform();
+          id(suppress_tx) = false;
+
+  # ============================ GUEST (unit 1) =============================
+  - platform: template
+    name: "Guest Timer 1h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 2
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Timer 2h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 9
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest Timer 4h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 25
+          freq: ${guest_freq_mhz}
+  - platform: template
+    name: "Guest All Off"
+    icon: mdi:power-off
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 1
+          id_: ${guest_id_dec}
+          k: ${guest_k}
+          cmd: 6
+          freq: ${guest_freq_mhz}
+      - lambda: |-
+          id(suppress_tx) = true;
+          id(guest_fan_on) = false;
+          id(guest_fan_breeze) = false;
+          id(guest_light_on) = false;
+          id(guest_fan).turn_off().perform();
+          id(guest_light).turn_off().perform();
+          id(suppress_tx) = false;
+  - platform: template
+    name: "Guest Light State Invert"
+    icon: mdi:lightbulb-question
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          id(suppress_tx) = true;
+          id(guest_light_on) = !id(guest_light_on);
+          if (id(guest_light_on)) id(guest_light).turn_on().perform();
+          else                    id(guest_light).turn_off().perform();
+          id(suppress_tx) = false;
+
+# -----------------------------------------------------------------------------
+# PHASE 2 (RX) — uncomment and bench-validate; NO rewiring (GDO0/GPIO5 is
+# shared for TX and RX per the component's own examples; add rx_pin with
+# allow_other_uses under radiolib_cc1101 above as well).
+#
+# remote_receiver:
+#   id: rf_receiver
+#   pin:
+#     number: ${pin_tx}
+#     allow_other_uses: true
+#     mode:
+#       input: true
+#       pullup: true
+#   # idle MUST be < the 7750us inter-frame sync gap but > the longest
+#   # within-frame space (~750us), or repeats merge and overflow the buffer.
+#   idle: 5500us
+#   filter: 120us
+#   buffer_size: 10kb
+#   tolerance: 35%
+#   dump: raw
+#   # RX handler sketch: gate on !id(radio_txing) (self-echo), decode the
+#   # 32-bit frame (mark >500us = 1), dedup on (ID, cmd, counter) equal to
+#   # last-seen within ~2s, then update globals + entities under suppress_tx
+#   # (the All Off lambda is the pattern). Optionally resync ctr_<fan> to
+#   # heard counter + 1.
+# -----------------------------------------------------------------------------

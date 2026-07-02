@@ -4,16 +4,37 @@ Control cheap 433 MHz OOK ceiling-fan + light remotes (the **XH-XXX-24V-B99**
 family and other EV1527/PT2262-class units) from Home Assistant, using an
 **ESP32-S3 + CC1101** running ESPHome with the RadioLib external component.
 
-This repo is a **transmit-only bridge**: it exposes one Home Assistant button per
-remote command and emits the matching RF frame. It does **not** track fan state on
-the device (see [Architecture](#architecture-why-stateless) for why), and it does
-**not** receive/decode the physical remotes (see [Roadmap](#roadmap--known-gaps)).
+This repo is a **transmit-only bridge**, shipped in **two variants** (see
+[Two variants](#two-variants)): a stateless one that exposes one Home Assistant
+button per remote command, and a stateful one that exposes native fan + light
+entities with on-device assumed state. Neither variant yet receives/decodes the
+physical remotes (see [Roadmap](#roadmap--known-gaps)).
 
 It is the product of a long, dead-end-heavy reverse-engineering effort. The
 [What we learned](#what-we-learned-the-hard-won-part) section documents both the
 solution and the four separate things that had to be fixed to get there, plus a
 detailed account of **what is proven vs. what is inferred**, so the next person
 doesn't repeat the loops.
+
+---
+
+## Two variants
+
+| Variant | File | What HA sees | State |
+|---------|------|--------------|-------|
+| **Stateless** (reference) | `ceiling-fan-radio.yaml` | 15 buttons per fan, 1:1 with RF commands | None on device — model state in HA if you want it |
+| **Stateful** (flagship) | `ceiling-fan-entity.yaml` | A native **fan entity** (on/off, 6 speeds, direction, "Breeze" preset) + a **light entity** + timer/All-Off buttons per fan | Assumed state on the device, restored from flash across reboots |
+
+Both share the same hardware, wiring, protocol values, and bench-proven transmit
+engine. **Flash one variant per board** — switching variants creates a new device
+in Home Assistant (delete the stale one).
+
+Pick the **stateless** variant if you want raw primitives to script against, or
+the smallest possible config to adapt to a different fan. Pick the **stateful**
+variant if you want the fan to look and act like a fan in HA (voice assistants,
+scenes, HomeKit bridge, the standard fan card) and accept optimistic state — see
+[The stateful variant](#the-stateful-variant) for exactly what it tracks and how
+it can drift.
 
 ---
 
@@ -25,8 +46,8 @@ doesn't repeat the loops.
    (they are unique per remote). See [Capturing & decoding](#capturing--decoding-your-remote).
    This is the hard 90% of adoption — the YAML is the easy 10%.
 3. Wire the CC1101 per [Wiring](#wiring), install the
-   [RadioLib component](#dependencies), paste your ID/K/frequency into the
-   `substitutions:` block of `ceiling-fan-radio.yaml`, and flash.
+   [RadioLib component](#dependencies), pick a [variant](#two-variants), paste
+   your ID/K/frequency into its `substitutions:` block, and flash.
 
 > **Note on the name.** "EV1527" here is an **inference from the
 > signaling**, not a part number we read off the chip. We never decapped the
@@ -102,11 +123,13 @@ but the shipped bridge does not use it.
 
 | File | Role |
 |------|------|
-| `ceiling-fan-radio.yaml` | The flat, single-file config. Two fans (Office, Guest) defined as repeated button blocks sharing one transmit engine. **This is what you edit and flash.** |
+| `ceiling-fan-radio.yaml` | The **stateless** variant: two fans (Office, Guest) as repeated button blocks sharing one transmit engine. The minimal reference — also the protocol-provenance record. |
+| `ceiling-fan-entity.yaml` | The **stateful** variant: native fan + light entities per fan, on-device assumed state, same transmit engine. See [The stateful variant](#the-stateful-variant). |
 
-> The config is intentionally a **single readable flat file** with some repetition
-> between fans, rather than a clever multi-file package. See
-> [Scaling up](#scaling-up--modularity) for the modular approach if you outgrow it.
+> Both configs are intentionally **single readable flat files** with some
+> repetition between fans, rather than clever multi-file packages. See
+> [Scaling up](#scaling-up--modularity) for the modular approach if you outgrow
+> that.
 
 ---
 
@@ -120,7 +143,7 @@ but the shipped bridge does not use it.
    [Capturing & decoding](#capturing--decoding-your-remote). You cannot skip this;
    the values in the repo (`0x003B9`/`K=0xB`, `0x18999`/`K=0xA`) are *our* remotes.
 
-3. **Edit `substitutions:`** in `ceiling-fan-radio.yaml`:
+3. **Edit `substitutions:`** in your chosen [variant](#two-variants):
    ```yaml
    substitutions:
      office_id_dec: "953"        # YOUR 20-bit ID, in DECIMAL (0x003B9 = 953)
@@ -132,16 +155,25 @@ but the shipped bridge does not use it.
 
 4. **Flash** via the ESPHome dashboard (Install → OTA or USB).
 
-5. The device exposes one HA button per command (e.g. `button.office_light`,
-   `button.office_speed_3`, `button.office_all_off`). Drive them directly, or build
-   HA-side logic on top (see [Architecture](#architecture-why-stateless)).
+5. **Stateless variant**: the device exposes one HA button per command (e.g.
+   `button.office_light`, `button.office_speed_3`, `button.office_all_off`) —
+   drive them directly or build HA-side logic on top (see
+   [Architecture](#architecture-why-stateless)). **Stateful variant**: the device
+   exposes `fan.office_fan`, `light.office_light`, and timer/All-Off buttons (see
+   [The stateful variant](#the-stateful-variant)).
 
 ---
 
 ## Architecture: why stateless
 
-The ESP is a **stateless transmitter**. Each button emits exactly one RF frame and
-the device tracks no fan/light state. This is deliberate:
+*(This section explains the **stateless variant**'s philosophy. The
+[stateful variant](#the-stateful-variant) is its deliberate counterpoint: it
+accepts the desync risks described here in exchange for native fan/light UX,
+and mitigates them explicitly.)*
+
+In the stateless variant the ESP is a **pure transmitter**. Each button emits
+exactly one RF frame and the device tracks no fan/light state. This is
+deliberate:
 
 - **A transmitter cannot observe the fan.** Any state the firmware claims is a
   guess that desyncs the moment someone uses the physical wall remote or the fan
@@ -153,10 +185,10 @@ the device tracks no fan/light state. This is deliberate:
   even with perfect state tracking, the light can only ever be tracked
   optimistically. This is a protocol limit, not a design shortcut.
 
-If you want a single "Off / Fwd 1–6 / Rev 1–6" control with (optimistic) state, or
-presence-gated behavior, build it **in Home Assistant** with an `input_select` +
-an automation that calls these buttons. That layer is intentionally not on the
-device.
+If you're running the stateless variant and want a single "Off / Fwd 1–6 /
+Rev 1–6" control with (optimistic) state, build it **in Home Assistant** with an
+`input_select` + an automation that calls these buttons — or just run the
+[stateful variant](#the-stateful-variant), which does that modeling on-device.
 
 ### The rolling counter (the one piece of retained state)
 
@@ -171,6 +203,51 @@ the UX.
 > counter or ignores it. We kept per-fan counters for fidelity to the real remotes
 > rather than because we proved the fan rejects a static counter. If you want
 > maximum simplicity you could use a single shared counter; we chose fidelity.
+
+---
+
+## The stateful variant
+
+`ceiling-fan-entity.yaml` turns each fan into a native ESPHome **fan entity**
+(on/off, 6-step speed slider, forward/reverse, a "Breeze" preset for the
+Variable command) plus a **light entity**, with **assumed state** kept in
+flash-restored globals on the device. Native entities mean the standard HA fan
+card, scenes, voice assistants, and the HomeKit bridge all work without any
+HA-side config.
+
+**What HA sees per fan:** `fan.<name>_fan`, `light.<name>_light`, and buttons
+for Timer 1h/2h/4h, All Off, and a diagnostic "Light State Invert".
+
+**How it transmits.** All fan logic lives in one *reconciler* per fan: on every
+entity state change it diffs the commanded state against the assumed physical
+state and transmits only the differences (the protocol is mostly absolute, so
+each difference is one frame). Transmissions are serialized through a queued
+script (~450 ms apart) so slider drags and multi-frame settles can't overlap on
+the air.
+
+**Honesty about "assumed" state.** A transmitter still can't observe the fan;
+this variant *chooses* optimistic tracking and mitigates the drift paths:
+
+| Drift path | Behavior / remedy |
+|---|---|
+| Light (protocol-level **toggle**, no discrete on/off) | Entity transmits the toggle only when commanded state ≠ assumed state. If it drifts (e.g. someone used the wall remote), press **Light State Invert** — flips the assumption without transmitting. |
+| Timer buttons | Fire-and-forget; when the fan's own timer fires, the fan entity stays "on" until your next command. Deliberate — timer-cancellation semantics are unverified. |
+| Fan power cycle | Desyncs everything until the next command. Unavoidable without RX. |
+| Anything else | **All Off** transmits the atomic all-off frame and force-syncs fan + light entities to off — it is the manual resync-to-known-state affordance. |
+
+**Boot behavior: nothing is ever transmitted at boot.** A suppress guard boots
+armed-off, the saved assumed state is pushed into the entities silently, and
+only then is transmit enabled. OTA updates and reboots never disturb a running
+fan.
+
+**Direction while off** is displayed immediately but transmitted on the next
+turn-on (as speed-then-direction, ~450 ms apart) — whether a direction frame
+starts a stopped fan is unverified, so we don't risk it.
+
+**Bench-verify before trusting** (open behavioral questions, checklist order):
+does Speed N start a stopped fan; boot silence across reboots; state restore
+across a hard power cycle; the All Off trace showing exactly one transmitted
+frame.
 
 ---
 
@@ -418,12 +495,17 @@ Two gotchas if you go the package route:
 
 ## Roadmap / known gaps
 
-- **No RX state-tracking (yet).** This bridge transmits only. Decoding the physical
-  wall remotes so HA reflects manual presses is feasible (we proved the CC1101
-  hears them) but **intentionally deferred**: different fans in a home may use
-  different carrier frequencies, so a single always-on receiver can't reliably
-  cover them. The radio is left parked in RX/idle between transmits so it doesn't
-  hold a band keyed.
+- **No RX state-tracking (yet).** Both variants transmit only. Decoding the
+  physical wall remotes so state reflects manual presses is feasible (we proved
+  the CC1101 hears them) and both our fans are now verified on the same
+  433.92 MHz carrier, so a single parked receiver could cover them. The stateful
+  variant already ships the **seams**: a transmitting flag for self-echo
+  gating, a suppressed state-sync path (the All Off pattern *is* the future RX
+  handler pattern), a counter-based press-dedup plan, a pinned component
+  commit, and a commented-out same-pin `remote_receiver` block (the component's
+  own examples share GDO0 for TX and RX — no rewiring expected). Still deferred
+  pending bench validation. The radio parks in RX/idle between transmits so it
+  doesn't hold a band keyed.
 - **The light is toggle-only.** No amount of work makes light state authoritative
   without RX feedback, and even with RX it self-heals only on the next press. Plan
   HA-side light state as optimistic.
