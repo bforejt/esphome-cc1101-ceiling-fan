@@ -4,11 +4,13 @@ Control cheap 433 MHz OOK ceiling-fan + light remotes (the **XH-0SFS-24V-B99**
 family and other EV1527/PT2262-class units) from Home Assistant, using an
 **ESP32-S3 + CC1101** running ESPHome with the RadioLib external component.
 
-This repo is a **transmit-only bridge**, shipped in **two variants** (see
-[Two variants](#two-variants)): a stateless one that exposes one Home Assistant
-button per remote command, and a stateful one that exposes native fan + light
-entities with on-device assumed state. Neither variant yet receives/decodes the
-physical remotes (see [Roadmap](#roadmap--known-gaps)).
+This repo is an **RF bridge**, shipped in **two variants** (see
+[Two variants](#two-variants)): a **stateless, transmit-only** one that exposes
+one Home Assistant button per remote command, and a **stateful** one that
+exposes native fan + light entities with on-device assumed state — and that
+**also listens**: it decodes presses from the physical remotes and mirrors them
+into the entities, live in HA (see
+[The stateful variant](#the-stateful-variant) for the honest limits of that).
 
 It is the product of a long, dead-end-heavy reverse-engineering effort. The
 [What we learned](#what-we-learned-the-hard-won-part) section documents both the
@@ -23,7 +25,7 @@ doesn't repeat the loops.
 | Variant | File | What HA sees | State |
 |---------|------|--------------|-------|
 | **Stateless** (reference) | `ceiling-fan-radio.yaml` | 15 buttons per fan, 1:1 with RF commands | None on device — model state in HA if you want it |
-| **Stateful** (flagship) | `ceiling-fan-entity.yaml` | A native **fan entity** (on/off, 6 speeds, direction, "Breeze" preset) + a **light entity** + timer/All-Off buttons per fan | Assumed state on the device, restored from flash across reboots |
+| **Stateful** (flagship) | `ceiling-fan-entity.yaml` | A native **fan entity** (on/off, 6 speeds, direction, "Breeze" preset) + a **light entity** + timer/All-Off buttons per fan | Assumed state on the device, restored from flash across reboots — and **updated by listening to the physical remotes** (clean RF signal required; see below) |
 
 Both share the same hardware, wiring, protocol values, and bench-proven transmit
 engine. **Flash one variant per board** — switching variants creates a new device
@@ -32,7 +34,8 @@ in Home Assistant (delete the stale one).
 Pick the **stateless** variant if you want raw primitives to script against, or
 the smallest possible config to adapt to a different fan. Pick the **stateful**
 variant if you want the fan to look and act like a fan in HA (voice assistants,
-scenes, HomeKit bridge, the standard fan card) and accept optimistic state — see
+scenes, HomeKit bridge, the standard fan card), want wall-remote presses
+reflected in HA, and accept optimistic state — see
 [The stateful variant](#the-stateful-variant) for exactly what it tracks and how
 it can drift.
 
@@ -98,13 +101,16 @@ MOSI   ───────►   GPIO11
 MISO   ───────►   GPIO13
 VCC    ───────►   3V3       (NOT 5V)
 GND    ───────►   GND
-GDO2              (unused in this transmit-only build)
+GDO2   ───────►   GPIO6     (receive data; needed only by the stateful variant's RX)
 ```
 
-Receive needs **no extra wiring**: in receive mode the CC1101 outputs
-demodulated data on the same GDO0 pin, which is how the shipped
-`ceiling-fan-listener.yaml` capture tool works (see
-[Capturing](#capturing--decoding-your-remote)). GDO2 stays unconnected.
+Receive comes in two flavors. The standalone `ceiling-fan-listener.yaml`
+capture tool needs **no GDO2 wire** — in receive mode the CC1101 outputs
+demodulated data on the same GDO0 pin (see
+[Capturing](#capturing--decoding-your-remote)). The **stateful variant's
+built-in RX** listens on **GDO2 → GPIO6** instead, because GDO0 is owned by
+transmit; the firmware routes RX data to GDO2 at boot. If you only run the
+stateless variant, leave GDO2 unconnected.
 
 ---
 
@@ -227,14 +233,44 @@ each difference is one frame). Transmissions are serialized through a queued
 script (~450 ms apart) so slider drags and multi-frame settles can't overlap on
 the air.
 
+**How it listens (work in progress).** The radio parks in receive between
+transmits and decodes B99 frames from the physical remotes (RX data on
+GDO2 → GPIO6). A press whose ID **and** checksum key match a configured fan is
+mirrored into the entities — no re-transmit — and Home Assistant updates live;
+the rolling counter also resyncs so our next transmit continues the remote's
+sequence. Presses from **unknown** remotes are logged (tag `rx_discover`) with
+their decoded `id` and `K` — which is how you onboard a new remote straight
+from the web-page log. Validated with the two fans this repo was built
+against.
+
+The **goal** is to keep all three parties — the fan controller, the physical
+remote, and this ESP — in sync where possible. Be clear-eyed about the limits:
+
+- **The RF signal must be clean for reliable decode.** The fan's purpose-built
+  receiver is far more forgiving than our general-purpose CC1101: one of our
+  two remotes decodes perfectly, while the other operates its fan reliably yet
+  arrives too noisy for us to decode consistently. (Register-tuning
+  experiments — RX data rate, DN022 AGC — both made things worse and were
+  reverted; the git history documents them. Carrier-offset measurement via
+  SDR is the open diagnostic lead.)
+- **The protocol is one-way.** The fan controller never acknowledges anything,
+  so there is no confirmation that a command — ours or the remote's — was
+  actually acted on. Sync drift cannot be *prevented*, only reduced and
+  repaired (All Off, Light State Invert).
+- **Half-duplex.** The radio is deaf during its own ~400 ms transmits; a
+  remote press in exactly that window is missed.
+
+Treat the three-way sync as **best-effort and a work in progress** — useful,
+not guaranteed.
+
 **Honesty about "assumed" state.** A transmitter still can't observe the fan;
 this variant *chooses* optimistic tracking and mitigates the drift paths:
 
 | Drift path | Behavior / remedy |
 |---|---|
-| Light (protocol-level **toggle**, no discrete on/off) | Entity transmits the toggle only when commanded state ≠ assumed state. If it drifts (e.g. someone used the wall remote), press **Light State Invert** — flips the assumption without transmitting. |
+| Light (protocol-level **toggle**, no discrete on/off) | Entity transmits the toggle only when commanded state ≠ assumed state. RX flips the assumption when it decodes a wall-remote Light press (clean signal required); if it still drifts, press **Light State Invert** — flips the assumption without transmitting. |
 | Timer buttons | Fire-and-forget; when the fan's own timer fires, the fan entity stays "on" until your next command. Deliberate — timer-cancellation semantics are unverified. |
-| Fan power cycle | Desyncs everything until the next command. Unavoidable without RX. |
+| Fan power cycle | Desyncs everything until the next decoded remote press or command. |
 | Anything else | **All Off** transmits the atomic all-off frame and force-syncs fan + light entities to off — it is the manual resync-to-known-state affordance. |
 
 **Boot behavior: nothing is ever transmitted at boot.** A suppress guard boots
@@ -246,10 +282,10 @@ fan.
 turn-on (as speed-then-direction, ~450 ms apart) — whether a direction frame
 starts a stopped fan is unverified, so we don't risk it.
 
-**Bench-verify before trusting** (open behavioral questions, checklist order):
-does Speed N start a stopped fan; boot silence across reboots; state restore
-across a hard power cycle; the All Off trace showing exactly one transmitted
-frame.
+**Bench status:** working with both of our fans in normal use — TX control and
+RX mirroring (with the clean-signal remote) validated. Still open: whether
+Speed N or F/R starts a *stopped* fan (the reconciler is written defensively
+around both unknowns), and reliable decode of the noisier remote (see above).
 
 ---
 
@@ -499,24 +535,21 @@ Two gotchas if you go the package route:
 
 ## Roadmap / known gaps
 
-- **No RX state-tracking (yet).** Both variants transmit only. Decoding the
-  physical wall remotes so state reflects manual presses is feasible (we proved
-  the CC1101 hears them) and both our fans are now verified on the same
-  433.92 MHz carrier, so a single parked receiver could cover them. The stateful
-  variant already ships the **seams**: a transmitting flag for self-echo
-  gating, a suppressed state-sync path (the All Off pattern *is* the future RX
-  handler pattern), a counter-based press-dedup plan, a pinned component
-  commit, and a commented-out same-pin `remote_receiver` block (the component's
-  own examples share GDO0 for TX and RX — no rewiring expected). The
-  `ceiling-fan-listener.yaml` capture tool exercises exactly this receive path,
-  so running it doubles as the feasibility check. Still deferred pending bench
-  validation. The radio parks in RX/idle between transmits so it doesn't hold
-  a band keyed.
+- **RX state-tracking: shipped in the stateful variant** (GDO2 → GPIO6), a
+  **work in progress**. Wall-remote presses update the entities live in HA;
+  unknown remotes are discoverable from the logs (`rx_discover`). Open items:
+  reliable decode needs a **clean signal** — one of our two remotes still
+  arrives too noisy (carrier-offset measurement via SDR is the next
+  diagnostic; blind register tuning has been tried and reverted) — and the
+  one-way protocol means sync drift can never be fully eliminated, only
+  repaired. The radio parks in RX between transmits so it doesn't hold a band
+  keyed.
 - **The light is toggle-only.** No amount of work makes light state authoritative
-  without RX feedback, and even with RX it self-heals only on the next press. Plan
-  HA-side light state as optimistic.
-- **Half-duplex.** The radio is deaf during the ~330 ms it transmits. Irrelevant
-  for a pure transmitter; relevant if you later add RX.
+  without perfect RX coverage, and even then it self-heals only on the next
+  press. Plan light state as optimistic.
+- **Half-duplex.** The radio is deaf during the ~400 ms it transmits. Irrelevant
+  for the stateless variant; for the stateful variant it means a wall-remote
+  press in exactly that window is missed.
 
 ---
 
@@ -529,6 +562,12 @@ Two gotchas if you go the package route:
 - The 32-bit frame layout, bit timings, and checksum formula (verified against
   many captures decoding self-consistently).
 - Our two remotes' IDs and K values.
+- The stateful variant's RX path: IOCFG2-routed data on GDO2 → GPIO6 +
+  `remote_receiver` decodes a clean-signal remote and mirrors its presses into
+  the entities, live in HA, alongside working transmit.
+- Turning RX registers blindly breaks reception: DRATE 10 (with stock AGC) and
+  DN022 AGC values (with DRATE 100) each went completely deaf — both reverted;
+  the shipped SmartRC-AGC + DRATE-100 combination is a narrow working point.
 
 **Inferred (consistent with evidence, not directly confirmed):**
 - That the encoder is specifically EV1527/PT2262 (identified by *behavior*, not by
@@ -539,8 +578,12 @@ Two gotchas if you go the package route:
 **Unknown / not tested:**
 - Whether the fan validates the rolling counter or ignores it (we kept per-fan
   counters for fidelity regardless).
-- Whether a dedicated RX-on-GDO2 path is fully reliable over long runs (out of
-  scope for this transmit-only build).
+- Why one of our two remotes decodes cleanly and the other doesn't, despite
+  both operating their fans reliably (carrier offset is the leading suspect —
+  unmeasured; the fans' purpose-built receivers are simply more forgiving than
+  our CC1101).
+- Whether Speed N or F/R starts a *stopped* fan (the stateful reconciler is
+  written defensively around both possibilities).
 
 ---
 

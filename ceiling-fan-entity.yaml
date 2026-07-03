@@ -83,11 +83,20 @@
 #      the demodulator is off): radio_txing flag + a 1.2 s post-TX quiet
 #      window (tx_last_ms), plus whole-frame dedup (~10 repeats per press,
 #      counter increments per press) so one press = one action.
-#    - BENCH ORDER for this branch: (1) TX regression FIRST — IOCFG2 must not
-#      disturb transmit; (2) remote press decodes appear; (3) entity state
-#      follows remote presses in HA; (4) our own TX causes no phantom RX
-#      (watch the light especially — a self-heard toggle would double-flip);
-#      (5) unknown-remote discovery lines.
+#    - STATUS: working with both of the author's fans. RELIABLE DECODE NEEDS
+#      A CLEAN SIGNAL — one remote decodes perfectly; the other operates its
+#      fan fine but arrives too noisy for consistent decode (the fan's
+#      purpose-built receiver is more forgiving than our CC1101). Register
+#      experiments (RX DRATE 10; DN022 AGC) each went fully deaf and were
+#      reverted — the shipped SmartRC-AGC + DRATE-100 combo is a narrow
+#      working point; do not retune blindly. Carrier-offset measurement via
+#      SDR is the open diagnostic lead.
+#    - GOAL & LIMITS: keep the fan controller, the physical remote, and this
+#      ESP in sync where possible. WORK IN PROGRESS — not perfectly reliable:
+#      the protocol is ONE-WAY (the controller never confirms anything), so
+#      drift can only be reduced and repaired (All Off, Light State Invert),
+#      never fully prevented. The radio is also deaf during its own ~400ms
+#      transmits; a remote press in that window is missed.
 # #############################################################################
 
 substitutions:
