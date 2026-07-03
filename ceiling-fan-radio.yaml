@@ -3,7 +3,7 @@
 # ##  Stateless transmit-only "command button" architecture                  ##
 # #############################################################################
 #
-#  Reference implementation for controlling cheap "B99" (XH-XXX-24V-B99)
+#  Reference implementation for controlling cheap "B99" (XH-0SFS-24V-B99)
 #  433.92 MHz OOK ceiling-fan/light remotes from Home Assistant via an
 #  ESP32-S3 + CC1101 (E07-M1101D), using the RadioLib external component.
 #
