@@ -239,6 +239,21 @@ radiolib_cc1101:
   id: mycc1101
   cs_pin: GPIO10
   bitrate: 100
+  # ---- EXPERIMENT 1 (AGC-only; revert this block if RX degrades) ----
+  # TI DN022 OOK/ASK guidance: AGCCTRL2 0x03-0x07, AGCCTRL1 0x00,
+  # AGCCTRL0 0x91/0x92 (DN022's example found best sensitivity at 0x04/
+  # 0x00/0x92). The component's defaults are SmartRC values (0xC7/0x00/
+  # 0xB2); 0xC7 disables the top three DVGA gain steps — a strong-signal
+  # stability tune that costs weak-signal sensitivity, matching our
+  # symptom (strong remote clean, weak remote shreds). AGC only operates
+  # in RX; TX is untouched. NOTE: AGC and DRATE interact (bench-proven:
+  # DRATE 10 + SmartRC AGC = deaf), and DN022's example point was
+  # 3.8 kBaud/100 kHz BW vs our 100 kBaud/464 kHz — so this is an
+  # EXPERIMENT: success = weak remote decodes improve with strong remote
+  # still clean; failure = revert to defaults (omit these three keys).
+  reg_agcctrl2: 0x04
+  reg_agcctrl1: 0x00
+  reg_agcctrl0: 0x92
   # RX data is routed to GDO2/GPIO6 by the IOCFG2 write in on_boot (RadioLib
   # only configures GDO0, which TX owns). rx_pin is deliberately NOT set: it
   # only feeds the component's opportunistic RSSI sampling, and leaving it
