@@ -281,13 +281,16 @@ only then is transmit enabled. OTA updates and reboots never disturb a running
 fan.
 
 **Direction while off** is displayed immediately but transmitted on the next
-turn-on (as speed-then-direction, ~450 ms apart) — whether a direction frame
-starts a stopped fan is unverified, so we don't risk it.
+turn-on (as speed-then-direction, ~450 ms apart). This is deliberate: any
+command — F/R included — **starts a stopped fan** (verified), so transmitting
+the direction change immediately would surprise-start it.
 
 **Bench status:** working with both of our fans in normal use — TX control and
-RX mirroring (with the clean-signal remote) validated. Still open: whether
-Speed N or F/R starts a *stopped* fan (the reconciler is written defensively
-around both unknowns), and reliable decode of the noisier remote (see above).
+RX mirroring (with the clean-signal remote) validated. Also verified: **any
+command (speeds, F/R) starts a stopped fan**, and the controller **remembers
+its last speed and direction across a stop** — the same memory model this
+firmware's state globals use. Still open: reliable decode of the noisier
+remote (see above).
 
 ---
 
@@ -567,6 +570,9 @@ Two gotchas if you go the package route:
 - The stateful variant's RX path: IOCFG2-routed data on GDO2 → GPIO6 +
   `remote_receiver` decodes a clean-signal remote and mirrors its presses into
   the entities, live in HA, alongside working transmit.
+- Any command starts a stopped fan (speeds and F/R both verified), and the
+  controller remembers its last speed and direction across a stop — matching
+  this firmware's state model.
 - Turning RX registers blindly breaks reception: DRATE 10 (with stock AGC) and
   DN022 AGC values (with DRATE 100) each went completely deaf — both reverted;
   the shipped SmartRC-AGC + DRATE-100 combination is a narrow working point.
@@ -584,8 +590,9 @@ Two gotchas if you go the package route:
   both operating their fans reliably (carrier offset is the leading suspect —
   unmeasured; the fans' purpose-built receivers are simply more forgiving than
   our CC1101).
-- Whether Speed N or F/R starts a *stopped* fan (the stateful reconciler is
-  written defensively around both possibilities).
+- Which mode a stopped fan resumes in when it was last in Breeze (the firmware
+  assumes a stop clears variable mode; if the controller remembers Breeze too,
+  state drifts until the next command).
 
 ---
 

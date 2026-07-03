@@ -42,10 +42,11 @@
 #      to off — it IS the manual resync-to-known-state affordance.
 #    - Fan power cycle desyncs everything until the next command. Unavoidable
 #      without RX; RX (roadmap) heals fan state on the next remote press.
-#    - Direction set while the fan is OFF is NOT transmitted (whether F/R
-#      starts a stopped fan is unverified); it displays immediately and is
-#      applied on the next turn-on as [Speed N, then F/R], queued ~450ms
-#      apart.
+#    - Direction set while the fan is OFF is NOT transmitted; it displays
+#      immediately and is applied on the next turn-on as [Speed N, then
+#      F/R], queued ~450ms apart. Deliberate: ANY command — F/R included —
+#      starts a stopped fan (verified), so transmitting the direction change
+#      immediately would surprise-start it.
 #
 #  PROVENANCE: protocol, timings, wiring, and the four hard-won fixes are
 #  documented in ceiling-fan-radio.yaml and the README. The tx_send frame
