@@ -10,7 +10,8 @@ one Home Assistant button per remote command, and a **stateful** one that
 exposes native fan + light entities with on-device assumed state — and that
 **also listens**: it decodes presses from the physical remotes and mirrors them
 into the entities, live in HA (see
-[The stateful variant](#the-stateful-variant) for the honest limits of that).
+[The stateful variant](#the-stateful-variant) for what to expect, and its
+limits).
 
 It is the product of a long, dead-end-heavy reverse-engineering effort. The
 [What we learned](#what-we-learned-the-hard-won-part) section documents both the
@@ -244,7 +245,7 @@ from the web-page log. Validated with the two fans this repo was built
 against.
 
 The **goal** is to keep all three parties — the fan controller, the physical
-remote, and this ESP — in sync where possible. Be clear-eyed about the limits:
+remote, and this ESP — in sync where possible. Please note the limits:
 
 - **The RF signal must be clean for reliable decode.** The fan's purpose-built
   receiver is far more forgiving than our general-purpose CC1101: one of our
@@ -263,8 +264,9 @@ remote, and this ESP — in sync where possible. Be clear-eyed about the limits:
 Treat the three-way sync as **best-effort and a work in progress** — useful,
 not guaranteed.
 
-**Honesty about "assumed" state.** A transmitter still can't observe the fan;
-this variant *chooses* optimistic tracking and mitigates the drift paths:
+**Please note: "assumed" state can drift.** A transmitter still can't observe
+the fan; this variant *chooses* optimistic tracking and mitigates the drift
+paths:
 
 | Drift path | Behavior / remedy |
 |---|---|

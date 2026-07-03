@@ -29,7 +29,7 @@
 #  future RX) — trigger callbacks run synchronously inside perform(), so a
 #  set/clear pair inside one lambda brackets them.
 #
-#  HONESTY OF "ASSUMED" STATE: a transmitter cannot observe the fan. This
+#  ASSUMED STATE — PLEASE NOTE: a transmitter cannot observe the fan. This
 #  variant *chooses* to track optimistic state anyway (that's its point);
 #  known desync paths and their remedies:
 #    - Light is a protocol-level TOGGLE (no discrete on/off). If it drifts,
