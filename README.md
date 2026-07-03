@@ -1,6 +1,6 @@
 # EV1527 / B99 433 MHz Ceiling-Fan RF Bridge for Home Assistant
 
-Control cheap 433 MHz OOK ceiling-fan + light remotes (the **XH-XXX-24V-B99**
+Control cheap 433 MHz OOK ceiling-fan + light remotes (the **XH-0SFS-24V-B99**
 family and other EV1527/PT2262-class units) from Home Assistant, using an
 **ESP32-S3 + CC1101** running ESPHome with the RadioLib external component.
 
@@ -66,7 +66,7 @@ it can drift.
 | MCU | ESP32-S3-DevKitM-1 | Any ESP32 with a free SPI bus + GPIOs should work; pin numbers below are S3. |
 | Radio | CC1101 (E07-M1101D) | 433 MHz module. **Power from 3V3, never 5V.** |
 | Fan fixture | [Ohniyou Cage 21-inch Flush-Mount Bladeless](https://ohniyou.com/products/ohniyou-cage-21-inch-flush-mount-bladeless-ceiling-fan-006-%E5%A4%8D%E5%88%B6-006%E5%A4%9A%E5%B1%9E%E6%80%A7-2-%E5%A4%8D%E5%88%B6) | The specific ceiling fan validated against. |
-| Fan RF receiver + remote | `XH-XXX-24V-B99` "DC motor Control Driver" + handheld remote | The 433 MHz OOK receiver built into the fan and its stock 15-button remote — what this bridge emulates. The middle characters of the model were illegible on our unit; the `-24V-B99` family suffix is the identifier that matters. |
+| Fan RF receiver + remote | `XH-0SFS-24V-B99` "DC motor Control Driver" + handheld remote | The 433 MHz OOK receiver built into the fan and its stock 15-button remote — what this bridge emulates. The middle characters were illegible on our unit; the full model comes from the label in [Ohniyou's replacement-kit listing](https://ohniyou.com/products/universal-ceiling-fan-with-light-remote-control-kit-black-1) (same photo as below — also the replacement-part source), matching sibling model `XH-0SFS-24V-TM`. |
 
 The **B99 receiver** is a DC-motor (ECM) fan controller wired inline between AC
 mains and the fan: a mains input, a dimmable LED **LAMP** output, a 3-phase
