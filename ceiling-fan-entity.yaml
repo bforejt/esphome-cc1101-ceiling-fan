@@ -52,33 +52,49 @@
 #  builder below is copied VERBATIM from the bench-proven original; only its
 #  script mode (queued) and a pacing delay are new.
 #
-#  WIRING (ESP32-S3-DevKitM-1 <-> CC1101 E07-M1101D):
-#    GDO0->GPIO5  CSN->GPIO10  SCK->GPIO12  MOSI->GPIO11  MISO->GPIO13
-#    VCC->3V3 (NOT 5V)  GND->GND.   GDO2 unused (transmit-only).
+#  WIRING (ESP32-S3-DevKitM-1 <-> CC1101 E07-M1101D) — DUAL-PIN on this
+#  branch (TX unchanged from the proven build; RX added on GDO2):
+#    GDO0->GPIO5  (transmit data — open-drain + pullup, as always)
+#    GDO2->GPIO6  (receive data — see RX section below)
+#    CSN->GPIO10  SCK->GPIO12  MOSI->GPIO11  MISO->GPIO13
+#    VCC->3V3 (NOT 5V)  GND->GND.
 #
-#  PHASE 2 (RX) SEAMS, built now:
-#    - radio_txing flag (set on_transmit / cleared on_complete) for the RX
-#      handler to gate out self-echo — the shared GDO0 pin toggles with our
-#      own bit stream during TX and the component does not suppress it.
-#    - The suppressed state-sync path (see All Off) is exactly the RX
-#      handler pattern: decode -> set globals -> push entity state under
-#      suppress_tx.
-#    - RX dedup plan: physical remotes hold the 3-bit counter constant
-#      across the ~10 repeats of one press, so a decoded frame whose
-#      (ID, cmd, counter) tuple equals the last-seen tuple within a short
-#      window is the same press. One uint32 last_rx_frame global suffices.
-#    - Same-pin RX wiring: the component's own examples put rx_pin +
-#      remote_receiver + remote_transmitter ALL on GDO0 with
-#      allow_other_uses: true — no rewiring. See the commented block at the
-#      bottom of this file.
-#    - Component pinned to a verified commit (below) so RX lands against a
-#      known API (_freq, setup_direct_mode, xmit, recv, standby, set_rx_pin).
+#  RX — LISTENING TO THE PHYSICAL REMOTES (this branch):
+#    - The CC1101 demodulates continuously while parked in recv(); RadioLib's
+#      async direct mode only routes data to GDO0 (which TX owns here), so
+#      on_boot we set IOCFG2 = serial-data-out to ALSO route it to GDO2/GPIO6.
+#      IOCFG registers persist across TX/RX state changes; one set per boot.
+#    - remote_receiver (GPIO6) decodes B99 frames with the same scan-window
+#      decoder as the standalone listener.
+#    - Frames from OUR remotes (ID + checksum-K must BOTH match) update the
+#      entities through the suppressed state-sync path (no re-transmit); the
+#      native API pushes the change to Home Assistant live.
+#      Command mapping: Speed N -> on/speed/exits breeze; Fan Off -> off;
+#      All Off -> fan+light off; Light -> FLIPS assumed light state;
+#      F/R -> direction (entity-only when fan off: converges via the
+#      deferred-direction settle on next turn-on); Variable -> Breeze;
+#      Timers -> logged only (no state claim).
+#    - The TX rolling counter resyncs to (heard counter + 1) so our next
+#      transmit continues the remote's sequence.
+#    - UNKNOWN IDs are logged at INFO (tag "rx_discover") with id/cmd/cnt and
+#      the solved K — point the ESP web-page log at a new remote to onboard
+#      it.
+#    - Self-echo guards (belt & braces; GDO2 should be quiet during TX since
+#      the demodulator is off): radio_txing flag + a 1.2 s post-TX quiet
+#      window (tx_last_ms), plus whole-frame dedup (~10 repeats per press,
+#      counter increments per press) so one press = one action.
+#    - BENCH ORDER for this branch: (1) TX regression FIRST — IOCFG2 must not
+#      disturb transmit; (2) remote press decodes appear; (3) entity state
+#      follows remote presses in HA; (4) our own TX causes no phantom RX
+#      (watch the light especially — a self-heard toggle would double-flip);
+#      (5) unknown-remote discovery lines.
 # #############################################################################
 
 substitutions:
   device_name: ceiling-fan-entity
   friendly_name: "Ceiling Fan Entity"
-  pin_tx: "5"                 # GDO0 - transmit (single-pin)
+  pin_tx: "5"                 # GDO0 - transmit data
+  pin_rx: "6"                 # GDO2 - receive data (IOCFG2 routed at boot)
   sync_gap: "7750"            # EV1527 31T sync-gap (us); >=4000 required
   tx_pace: "450ms"            # >= RF airtime per command: 10 repeats x (~8ms sync + 32 x ~1ms) ~= 400ms
   # --- Office fan (unit 0) ---
@@ -107,14 +123,26 @@ esphome:
     priority: -100
     then:
       - lambda: |-
+          // Route demodulated RX data to GDO2 (GPIO6). RadioLib's async
+          // direct mode only configures GDO0 — which TX owns here. IOCFG
+          // registers persist across TX/RX state changes and nothing else
+          // (recv()/xmit()/set_registers()) touches IOCFG2, so once per boot
+          // suffices. radio.begin() already ran in component setup.
+          id(mycc1101).radio.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG2,
+                                            RADIOLIB_CC1101_GDOX_SERIAL_DATA_ASYNC, 5, 0);
+          ESP_LOGI("rx_b99", "IOCFG2 set: RX data routed to GDO2/GPIO%d", ${pin_rx});
           {  // Office fan
             auto call = id(office_fan).make_call();
             call.set_state(id(office_fan_on));
             call.set_direction(id(office_fan_fwd) ? fan::FanDirection::FORWARD
                                                   : fan::FanDirection::REVERSE);
-            if (id(office_fan_on)) {
-              if (id(office_fan_breeze)) call.set_preset_mode("Breeze");
-              else call.set_speed(id(office_fan_speed));
+            if (id(office_fan_on) && id(office_fan_breeze)) {
+              call.set_preset_mode("Breeze");   // set_speed would clear it (FanCall validation)
+            } else {
+              // Set stored speed even when OFF: a bare turn_on with entity
+              // speed 0 gets forced to MAX by FanCall validation, which
+              // would clobber "resume last speed" after a fresh boot.
+              call.set_speed(id(office_fan_speed));
             }
             call.perform();  // fires on_state -> suppressed no-op
           }
@@ -123,9 +151,10 @@ esphome:
             call.set_state(id(guest_fan_on));
             call.set_direction(id(guest_fan_fwd) ? fan::FanDirection::FORWARD
                                                  : fan::FanDirection::REVERSE);
-            if (id(guest_fan_on)) {
-              if (id(guest_fan_breeze)) call.set_preset_mode("Breeze");
-              else call.set_speed(id(guest_fan_speed));
+            if (id(guest_fan_on) && id(guest_fan_breeze)) {
+              call.set_preset_mode("Breeze");
+            } else {
+              call.set_speed(id(guest_fan_speed));
             }
             call.perform();
           }
@@ -159,6 +188,11 @@ ota:
   - platform: esphome
     on_begin:
       - lambda: id(mycc1101).standby();
+    # A successful OTA reboots (on_boot re-arms everything), but a FAILED or
+    # aborted OTA keeps running with the radio parked in standby — RX would
+    # go silently deaf until the next transmit. Recover explicitly.
+    on_error:
+      - lambda: id(mycc1101).recv();
 
 web_server:
   port: 80
@@ -192,22 +226,23 @@ remote_transmitter:
     then:
       - lambda: |-
           id(radio_txing) = true;
+          id(tx_last_ms) = millis();
           id(mycc1101).xmit();
   on_complete:
     then:
       - lambda: |-
           id(mycc1101).recv();
           id(radio_txing) = false;
+          id(tx_last_ms) = millis();
 
 radiolib_cc1101:
   id: mycc1101
   cs_pin: GPIO10
   bitrate: 100
-  # PHASE 2 (RX): add rx_pin on the SAME GPIO as TX (component examples do
-  # exactly this) — no rewiring:
-  #   rx_pin:
-  #     number: ${pin_tx}
-  #     allow_other_uses: true
+  # RX data is routed to GDO2/GPIO6 by the IOCFG2 write in on_boot (RadioLib
+  # only configures GDO0, which TX owns). rx_pin is deliberately NOT set: it
+  # only feeds the component's opportunistic RSSI sampling, and leaving it
+  # out keeps GPIO6 exclusively owned by the remote_receiver RMT channel.
 
 globals:
   # --- Protocol counters (unchanged from the radio variant; part of the RF
@@ -269,10 +304,14 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'true'
-  - id: radio_txing             # Phase-2 self-echo seam (set/cleared by TX hooks)
+  - id: radio_txing             # self-echo gate (set/cleared by TX hooks)
     type: bool
     restore_value: false
     initial_value: 'false'
+  - id: tx_last_ms              # last TX activity (millis); RX quiet-window gate
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
 
 # -----------------------------------------------------------------------------
 # Single transmit primitive — frame builder copied VERBATIM from the
@@ -287,7 +326,12 @@ globals:
 script:
   - id: tx_send
     mode: queued
-    max_runs: 10
+    # Deep queue: the reconcilers commit assumed-state globals at the same
+    # moment they enqueue the transmit, so a dropped run = silent desync
+    # (heal via All Off). 30 runs = ~13.5s worst-case backlog; a burst that
+    # deep means something upstream is wrong anyway, and ESPHome logs a
+    # warning on overflow.
+    max_runs: 30
     parameters:
       unit: int
       id_: int
@@ -623,28 +667,222 @@ button:
           id(suppress_tx) = false;
 
 # -----------------------------------------------------------------------------
-# PHASE 2 (RX) — uncomment and bench-validate; NO rewiring (GDO0/GPIO5 is
-# shared for TX and RX per the component's own examples; add rx_pin with
-# allow_other_uses under radiolib_cc1101 above as well).
-#
-# remote_receiver:
-#   id: rf_receiver
-#   pin:
-#     number: ${pin_tx}
-#     allow_other_uses: true
-#     mode:
-#       input: true
-#       pullup: true
-#   # idle MUST be < the 7750us inter-frame sync gap but > the longest
-#   # within-frame space (~750us), or repeats merge and overflow the buffer.
-#   idle: 5500us
-#   filter: 120us
-#   buffer_size: 10kb
-#   tolerance: 35%
-#   dump: raw
-#   # RX handler sketch: gate on !id(radio_txing) (self-echo), decode the
-#   # 32-bit frame (mark >500us = 1), dedup on (ID, cmd, counter) equal to
-#   # last-seen within ~2s, then update globals + entities under suppress_tx
-#   # (the All Off lambda is the pattern). Optionally resync ctr_<fan> to
-#   # heard counter + 1.
+# RX — decode the physical remotes on GDO2/GPIO6 and mirror their presses
+# into the entities (suppressed sync: no re-transmit; the native API pushes
+# the change to HA live). One INFO line per accepted press. Unknown remote
+# IDs are logged for discovery (tag "rx_discover") — visible in the ESP web
+# page's log pane.
 # -----------------------------------------------------------------------------
+remote_receiver:
+  id: rf_receiver
+  pin:
+    number: ${pin_rx}
+    mode:
+      input: true
+      pullup: true
+  # idle MUST be < the 7750us inter-frame sync gap but > the longest
+  # within-frame space (~750us), or repeats merge and overflow the buffer.
+  idle: 5500us
+  filter: 120us
+  buffer_size: 10kb
+  tolerance: 35%
+  on_raw:
+    - lambda: |-
+        // ---- Gates.
+        // Never process RX while ANY suppress window is open (boot restore
+        // included) — processing would end by clearing suppress_tx and could
+        // stomp the outer window's guard.
+        if (id(suppress_tx)) return;
+        // Nothing during, or within 1.2s after, our own TX. GDO2 should be
+        // quiet while transmitting (demodulator off), but a settle glitch
+        // decoded as a Light frame would double-flip the assumed light
+        // state — cheap insurance.
+        if (id(radio_txing)) return;
+        if ((millis() - id(tx_last_ms)) < 1200) return;
+
+        // ---- Decode. A clean chunk is [32 bit marks/spaces][next repeat's
+        // 250us sync mark]; noise can prepend slivers (the 120us receiver
+        // filter guarantees any surviving sliver passes the 100us shape
+        // bound), so scan ALL windows and PREFER one that validates against
+        // a configured remote (ID + checksum-K). Fall back to the first
+        // shape-valid window only for discovery of unknown remotes, which
+        // cannot be K-checked.
+        std::vector<int32_t> marks;
+        for (int32_t v : x)
+          if (v > 0) marks.push_back(v);
+        if (marks.size() < 32) return;   // sync-only chunk or noise
+        const int n = (int) marks.size();
+        uint32_t frame = 0;
+        bool found = false;    // first shape-valid window (discovery fallback)
+        bool valid = false;    // window that matches a configured ID with valid K
+        for (int s = 0; s + 32 <= n && !valid; s++) {
+          uint32_t f = 0;
+          bool ok = true;
+          for (int i = 0; i < 32; i++) {
+            const int32_t m = marks[s + i];
+            if (m < 100 || m > 1000) { ok = false; break; }
+            f = (f << 1) | (m > 500 ? 1u : 0u);
+          }
+          if (!ok) continue;
+          if (!found) { frame = f; found = true; }
+          const uint32_t r2 = f >> 12;
+          const uint8_t  k2 = ((f >> 8) & 0xF) ^ ((f >> 4) & 0xF) ^ (f & 0xF);
+          if ((r2 == (uint32_t) ${office_id_dec} && k2 == (${office_k} & 0xF)) ||
+              (r2 == (uint32_t) ${guest_id_dec}  && k2 == (${guest_k} & 0xF))) {
+            frame = f;
+            valid = true;
+          }
+        }
+        if (!found) return;
+
+        const uint32_t rid  = frame >> 12;          // 20-bit remote ID
+        const uint8_t  cmd  = (frame >> 7) & 0x1F;  // 5-bit command
+        const uint8_t  cnt  = (frame >> 4) & 0x7;   // 3-bit rolling counter
+        const uint8_t  csum = frame & 0xF;
+        const uint8_t  K    = ((frame >> 8) & 0xF) ^ ((frame >> 4) & 0xF) ^ csum;
+        const uint32_t now  = millis();
+
+        // ---- Route. Dedup state is committed ONLY after a frame passes
+        // validation for its path — a rejected misdecode must never poison
+        // the dedup slot, or the next clean repeat of the same press would
+        // re-fire the action (double-flipping the assumed light state).
+        int unit;
+        if (valid) {
+          unit = (rid == (uint32_t) ${office_id_dec}) ? 0 : 1;
+        } else if (rid == (uint32_t) ${office_id_dec} || rid == (uint32_t) ${guest_id_dec}) {
+          // Shape-valid but K wrong and no validated window in the chunk:
+          // a misdecoded repeat. Log and ignore; no state, no dedup.
+          ESP_LOGW("rx_b99", "%s ID but K=0x%X — misdecode, ignored (frame=0x%08X)",
+                   rid == (uint32_t) ${office_id_dec} ? "office" : "guest",
+                   K, (unsigned) frame);
+          return;
+        } else {
+          // Discovery: point the web-page log at any B99-family remote.
+          // Separate dedup slot so one press logs once, and a discovery
+          // frame never masks a same-moment press of OUR remotes.
+          static uint32_t disc_last_frame = 0;
+          static uint32_t disc_last_ms = 0;
+          if (frame == disc_last_frame && (now - disc_last_ms) < 2000) { disc_last_ms = now; return; }
+          disc_last_frame = frame;
+          disc_last_ms = now;
+          ESP_LOGI("rx_discover",
+                   "unknown remote: id=0x%05X (%u) cmd=0x%02X cnt=%u csum=0x%X -> K=0x%X (%u) frame=0x%08X rssi=%.0fdBm",
+                   (unsigned) rid, (unsigned) rid, (unsigned) cmd, (unsigned) cnt,
+                   (unsigned) csum, (unsigned) K, (unsigned) K,
+                   (unsigned) frame, id(mycc1101).getRSSI());
+          return;
+        }
+
+        // ---- Dedup (validated frames only): one action per physical
+        // press. A press is ~10 repeats of the identical frame; the counter
+        // increments per press, so even an immediate re-press of the same
+        // button differs. Refreshing the timestamp keeps a held button
+        // suppressed.
+        static uint32_t last_frame = 0;
+        static uint32_t last_ms = 0;
+        if (frame == last_frame && (now - last_ms) < 2000) { last_ms = now; return; }
+        last_frame = frame;
+        last_ms = now;
+
+        // ---- Per-unit handles (globals are references; entities are the
+        // same template types for both fans).
+        bool    &g_on     = (unit == 0) ? id(office_fan_on)     : id(guest_fan_on);
+        uint8_t &g_speed  = (unit == 0) ? id(office_fan_speed)  : id(guest_fan_speed);
+        bool    &g_fwd    = (unit == 0) ? id(office_fan_fwd)    : id(guest_fan_fwd);
+        bool    &g_breeze = (unit == 0) ? id(office_fan_breeze) : id(guest_fan_breeze);
+        bool    &g_light  = (unit == 0) ? id(office_light_on)   : id(guest_light_on);
+        uint8_t &g_ctr    = (unit == 0) ? id(ctr_office)        : id(ctr_guest);
+        fan::Fan *f = (unit == 0) ? (fan::Fan *) id(office_fan) : (fan::Fan *) id(guest_fan);
+        auto *lt = (unit == 0) ? id(office_light) : id(guest_light);
+        const char *who = (unit == 0) ? "office" : "guest";
+        // TX parameters for this unit (used by the deferred-direction settle).
+        const int   u_id   = (unit == 0) ? ${office_id_dec} : ${guest_id_dec};
+        const int   u_k    = (unit == 0) ? ${office_k} : ${guest_k};
+        const float u_freq = (unit == 0) ? ${office_freq_mhz} : ${guest_freq_mhz};
+
+        // Resync our TX counter to follow the remote's sequence.
+        g_ctr = (cnt + 1) & 0x7;
+
+        // Speed command lookup (1..6), 0 = not a speed command.
+        int spd = 0;
+        switch (cmd) {
+          case 0x10: spd = 1; break;
+          case 0x12: spd = 2; break;
+          case 0x1C: spd = 3; break;
+          case 0x0A: spd = 4; break;
+          case 0x0F: spd = 5; break;
+          case 0x0C: spd = 6; break;
+        }
+
+        // ---- Mirror the press into assumed state + entities, suppressed
+        // (the All Off button pattern): no RF goes out, HA updates live.
+        id(suppress_tx) = true;
+        if (spd > 0) {
+          g_on = true; g_breeze = false; g_speed = (uint8_t) spd;
+          auto call = f->make_call();
+          call.set_state(true);
+          call.set_speed(spd);   // FanCall validation clears any preset
+          call.perform();
+          ESP_LOGI("rx_b99", "%s remote: Speed %d (cnt=%u)", who, spd, cnt);
+          // Deferred-direction settle: if HA set a direction while the fan
+          // was off (entity direction != assumed physical), the remote just
+          // turned the fan on — apply the user's pending direction now.
+          // The reconciler can't do it (this sync runs suppressed), and
+          // script.execute is not gated by suppress_tx.
+          const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
+          if (want_fwd != g_fwd) {
+            id(tx_send).execute(unit, u_id, u_k, want_fwd ? 0x04 : 0x11, u_freq);
+            g_fwd = want_fwd;
+            ESP_LOGI("rx_b99", "%s: settling deferred direction -> %s", who, want_fwd ? "Forward" : "Reverse");
+          }
+        } else if (cmd == 0x16) {          // Fan Off
+          g_on = false; g_breeze = false;
+          f->turn_off().perform();
+          ESP_LOGI("rx_b99", "%s remote: Fan Off (cnt=%u)", who, cnt);
+        } else if (cmd == 0x06) {          // All Off
+          g_on = false; g_breeze = false; g_light = false;
+          f->turn_off().perform();
+          lt->turn_off().perform();
+          ESP_LOGI("rx_b99", "%s remote: All Off (cnt=%u)", who, cnt);
+        } else if (cmd == 0x08) {          // Light — protocol-level toggle
+          g_light = !g_light;
+          if (g_light) lt->turn_on().perform();
+          else         lt->turn_off().perform();
+          ESP_LOGI("rx_b99", "%s remote: Light toggle -> assumed %s (cnt=%u)",
+                   who, g_light ? "ON" : "OFF", cnt);
+        } else if (cmd == 0x04 || cmd == 0x11) {   // Forward / Reverse
+          const bool fwd = (cmd == 0x04);
+          auto call = f->make_call();
+          call.set_direction(fwd ? fan::FanDirection::FORWARD
+                                 : fan::FanDirection::REVERSE);
+          call.perform();
+          // Running: the fan applied it (validated) -> update the physical
+          // assumption. Off: whether F/R moves a stopped fan is unverified,
+          // so update the ENTITY only — the reconciler's deferred-direction
+          // settle transmits F/R on the next turn-on and converges either
+          // way.
+          if (g_on) g_fwd = fwd;
+          ESP_LOGI("rx_b99", "%s remote: %s (fan %s, cnt=%u)",
+                   who, fwd ? "Forward" : "Reverse", g_on ? "running" : "off", cnt);
+        } else if (cmd == 0x15) {          // Variable -> Breeze preset
+          g_on = true; g_breeze = true;
+          auto call = f->make_call();
+          call.set_state(true);
+          call.set_preset_mode("Breeze");
+          call.perform();
+          ESP_LOGI("rx_b99", "%s remote: Variable -> Breeze (cnt=%u)", who, cnt);
+          // Same deferred-direction settle as the Speed path.
+          const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
+          if (want_fwd != g_fwd) {
+            id(tx_send).execute(unit, u_id, u_k, want_fwd ? 0x04 : 0x11, u_freq);
+            g_fwd = want_fwd;
+            ESP_LOGI("rx_b99", "%s: settling deferred direction -> %s", who, want_fwd ? "Forward" : "Reverse");
+          }
+        } else if (cmd == 0x02 || cmd == 0x09 || cmd == 0x19) {   // Timers
+          ESP_LOGI("rx_b99", "%s remote: Timer %s — no state change (entity desyncs when it fires) (cnt=%u)",
+                   who, cmd == 0x02 ? "1h" : cmd == 0x09 ? "2h" : "4h", cnt);
+        } else {
+          ESP_LOGI("rx_b99", "%s remote: unrecognized cmd=0x%02X (cnt=%u frame=0x%08X)",
+                   who, cmd, cnt, (unsigned) frame);
+        }
+        id(suppress_tx) = false;
