@@ -105,13 +105,13 @@ GND    ───────►   GND
 GDO2   ───────►   GPIO6     (receive data; needed only by the stateful variant's RX)
 ```
 
-Receive comes in two flavors. The standalone `ceiling-fan-listener.yaml`
-capture tool needs **no GDO2 wire** — in receive mode the CC1101 outputs
-demodulated data on the same GDO0 pin (see
-[Capturing](#capturing--decoding-your-remote)). The **stateful variant's
-built-in RX** listens on **GDO2 → GPIO6** instead, because GDO0 is owned by
-transmit; the firmware routes RX data to GDO2 at boot. If you only run the
-stateless variant, leave GDO2 unconnected.
+Receive — both the **stateful variant's built-in RX** and the
+`ceiling-fan-listener.yaml` capture tool — listens on **GDO2 → GPIO6** (the
+firmware routes RX data to GDO2 at boot; GDO0 is owned by transmit in the
+bridges). Boards without the GDO2 wire can run the listener on same-pin GDO0
+instead by setting its `pin_rx: "5"` (see
+[Capturing](#capturing--decoding-your-remote)). If you only run the stateless
+variant, leave GDO2 unconnected.
 
 ---
 
@@ -133,7 +133,7 @@ stateless variant, leave GDO2 unconnected.
 |------|------|
 | `ceiling-fan-radio.yaml` | The **stateless** variant: two fans (Office, Guest) as repeated button blocks sharing one transmit engine. The minimal reference — also the protocol-provenance record. |
 | `ceiling-fan-entity.yaml` | The **stateful** variant: native fan + light entities per fan, on-device assumed state, same transmit engine. See [The stateful variant](#the-stateful-variant). |
-| `ceiling-fan-listener.yaml` | **Capture tool**, not a bridge: receive-only config that decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. Flash temporarily to extract your remote's values. See [Method A](#method-a--flash-the-shipped-listener-no-extra-hardware-no-rewiring). |
+| `ceiling-fan-listener.yaml` | **Capture tool**, not a bridge: receive-only config with a raw-vs-decode output toggle and runtime-tunable listen frequency. Decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. Flash temporarily to extract your remote's values. See [Method A](#method-a--flash-the-shipped-listener). |
 
 > Both configs are intentionally **single readable flat files** with some
 > repetition between fans, rather than clever multi-file packages. See
@@ -461,32 +461,47 @@ If it doesn't match, stop here; this won't work without re-deriving the protocol
 You need your remote's **20-bit ID** and **checksum key `K`**. Two capture methods
 worked for us.
 
-### Method A — flash the shipped listener (no extra hardware, no rewiring)
+### Method A — flash the shipped listener
 
-The repo ships `ceiling-fan-listener.yaml`: a receive-only config that decodes
-B99 frames off the air and logs your remote's values directly. The CC1101
-outputs demodulated RX data on the **same GDO0 pin** it takes TX data on, so
-the listener uses the exact bridge wiring — GDO2 stays unconnected.
+The repo ships `ceiling-fan-listener.yaml`: a receive-only config using the
+same **proven receive chain** as the stateful variant (RX data on
+GDO2 → GPIO6, DRATE 100, stock AGC — please note: bitrate 10 and DN022 AGC
+values were each bench-proven deaf on this hardware, so the listener
+deliberately matches the working combination). Boards without the GDO2 wire
+can set `pin_rx: "5"` to fall back to same-pin GDO0 receive.
+
+Two runtime controls, usable from the ESP's own web page or HA:
+
+- **Raw Dump Mode** switch (either/or): **off** = decode mode, **on** = raw
+  pulse lists for hand-decoding unknown protocols.
+- **Listen Frequency** + **Apply Frequency**: type a frequency in MHz, press
+  Apply — the radio re-tunes and restarts receive there (persists across
+  reboots). Useful for hunting an off-center remote; cheap SAW-resonator
+  transmitters can sit 100+ kHz off 433.92.
+
+To extract a remote's values:
 
 1. Flash `ceiling-fan-listener.yaml` (temporarily — reflash your bridge
-   variant afterwards) and stream logs.
+   variant afterwards), leave Raw Dump Mode off, and stream logs.
 2. Press a remote button near the antenna. Each press produces ~10 decoded
    lines (one per RF repeat) tagged `b99_decode`:
    ```
    frame=0x003B940F id=0x003B9 (953) cmd=0x08 cnt=0 csum=0xF -> K=0xB (11)
    ```
-   Identical repeats are your confidence signal.
+   Identical repeats are your confidence signal. An `rssi` line spiking from
+   the idle floor (−90s dBm) confirms the radio hears the transmission even
+   when nothing decodes.
 3. Press several **different** buttons: `K` must come out the same every time
    (it's a per-remote constant — see [Finding K](#finding-k)); `cnt` should
    increment by one per press, mod 8.
 4. Copy the decimal `id` and `K` into your bridge variant's `substitutions:`.
 
-If your remote is **not** a B99 (decodes look wrong, `K` inconsistent), use
-the listener's raw pulse dumps (`dump: raw`, on by default) and decode by
-hand: each **mark**
-(HIGH) > ~500 µs is a `1`, else `0`; assemble 32 bits MSB-first, then split
-per the [frame layout](#the-protocol-validated). The repeats are noisy at the
-edges — look for the cleanest 32-mark frame.
+If your remote is **not** a B99 (decodes look wrong, `K` inconsistent), flip
+**Raw Dump Mode** on and decode the pulse lists by hand: each **mark**
+(positive µs) > ~500 µs is a `1`, else `0`; assemble 32 bits MSB-first, then
+split per the [frame layout](#the-protocol-validated). The repeats are noisy
+at the edges — look for the cleanest 32-mark frame. Sporadic noise chunks
+with no transmission are normal for a wide-open OOK receiver.
 
 > **Gotcha we hit (documented so you don't):** the receiver's `idle` must be
 > *shorter* than the ≈7750 µs inter-frame sync gap but *longer* than the

@@ -1,60 +1,54 @@
 # #############################################################################
 # ##  B99 433MHz CEILING-FAN RF BRIDGE  —  ESP32 + CC1101 (RadioLib)         ##
-# ##  LISTENER — capture/decode tool for extracting a remote's ID and K     ##
+# ##  LISTENER — capture/decode tool with raw/decode toggle + tunable freq  ##
 # #############################################################################
 #
-#  A receive-only companion to the two bridge variants. Flash this TEMPORARILY
-#  to capture your remote's codes, then flash your chosen bridge variant back.
-#  Same wiring as the bridges — GDO0 on GPIO5, nothing else changes (the
-#  CC1101 outputs demodulated RX data on the same GDO0 pin it takes TX data
-#  on; GDO2 stays unconnected).
+#  A receive-only companion to the two bridge variants, for extracting a
+#  remote's ID and checksum key K, characterizing unknown remotes, and
+#  frequency-hunting. Flash it TEMPORARILY, then reflash your bridge variant.
 #
-#  HOW TO USE:
-#    1. Flash, then stream logs (`esphome logs ceiling-fan-listener.yaml`).
-#    2. Hold the remote near the antenna and press a button once.
-#    3. Read the decoded lines (tag "b99_decode"). One press = ~10 RF repeats,
-#       so expect several identical lines — identical repeats are your
-#       confidence signal. Example:
-#         frame=0x003B940F id=0x003B9 (953) cmd=0x08 cnt=0 csum=0xF -> K=0xB (11)
-#    4. Press several DIFFERENT buttons. K must come out identical on every
-#       press of this remote (it's a per-remote constant). If K varies, the
-#       bit alignment is off — see the README's "Finding K".
-#    5. Copy the decimal id and K into the bridge variant's substitutions.
-#       The counter (cnt) increments by one per press, mod 8 — a nice sanity
-#       check that you're seeing distinct presses.
+#  RX CHAIN — deliberately identical to the stateful variant's PROVEN receive
+#  path: RX data on GDO2 -> GPIO6 (routed via a boot-time IOCFG2 write),
+#  DRATE bitrate 100, stock SmartRC AGC. Do not "improve" these: bitrate 10
+#  and DN022 AGC values were each bench-proven completely deaf on this
+#  hardware (see the README and git history). Earlier revisions of this
+#  listener shipped bitrate 10 — which is very likely why they heard nothing.
+#  FALLBACK for boards with only GDO0 wired: set pin_rx to "5" — in receive
+#  mode RadioLib routes data to GDO0 natively (the IOCFG2 write is then
+#  harmless surplus).
 #
-#  DEBUG LAYERS — three independent signals, so a silent bench run tells you
-#  exactly which layer is failing:
-#    L0  boot log: "CC1101 setup begin/end init_state =0" from
-#        radiolib_cc1101.component. Non-zero = SPI/radio init failed.
-#    L1  RSSI (tag "rssi"): logged whenever it moves >6 dB. Idle floor is
-#        typically -90s dBm; pressing the remote nearby must spike it.
-#        No spike = the radio isn't hearing (frequency/antenna/init).
-#    L2  raw pulse dumps (dump: raw, ON by default): the demodulated bit
-#        stream reaching GPIO5. RSSI spikes but no dumps = pin path problem.
-#        NOTE: with the wide-open default bandwidth, sporadic NOISE dumps
-#        with no transmission are NORMAL (per the component author) — noise
-#        proves the pin path works. Tune bandwidth/AGC to quiet it.
-#    L3  decoded frames (tag "b99_decode"): every chunk logs a DEBUG line
-#        (edge/mark counts); full frames log the INFO line with id/K.
-#        Raw dumps but no decodes = decoder/alignment — capture a raw dump
-#        and check it by hand.
-#  Once decodes flow, comment out `dump: raw` for clean logs.
+#  CONTROLS (all usable from the ESP's web page or HA):
+#    - "Raw Dump Mode" switch — either/or output selector:
+#        OFF (default) = DECODE mode: each capture chunk is decoded as a B99
+#          frame and logged (tag "b99_decode") with id/cmd/cnt/csum, the
+#          solved K, and RSSI. One wall-remote press = ~10 repeats = ~10
+#          identical lines; identical repeats are your confidence signal.
+#          K must be constant across different buttons of one remote; cnt
+#          increments per press, mod 8.
+#        ON = RAW mode: the pulse list of every capture chunk is printed
+#          (tag "raw"; marks positive us, spaces negative us) — for
+#          hand-decoding non-B99 protocols or diagnosing decoder misses.
+#          Expect sporadic noise chunks with no transmission; that is normal
+#          for a wide-open OOK receiver and proves the pin path works.
+#    - "Listen Frequency" number + "Apply Frequency" button — type a
+#      frequency (MHz), press Apply: the radio re-tunes and restarts RX
+#      there. Survives reboot. Useful for hunting an off-center remote
+#      (cheap SAW-resonator transmitters can sit 100+ kHz off 433.92).
+#    - RSSI watcher (tag "rssi"): logs whenever RSSI moves >6 dB. Idle floor
+#      is typically -90s dBm; a remote pressed nearby must spike it — the
+#      carrier-detect layer that works regardless of decoding.
 #
-#  NON-B99 REMOTES: the decoder assumes the validated B99 32-bit layout
-#  ([20 id][5 cmd][3 cnt][4 csum], short/long OOK pulse pairs). If K is
-#  inconsistent across presses, decode the raw dumps by hand per the README
-#  (each HIGH mark > ~500us is a 1, else 0, 32 bits MSB-first).
-#
-#  This tool also doubles as the bench feasibility check for the roadmap RX
-#  feature: it proves the same-pin (GDO0) receive path on your hardware.
+#  HOW TO EXTRACT A REMOTE'S ID/K: flash, leave Raw Dump Mode OFF, stream
+#  logs (or open the web page), press each remote button near the antenna,
+#  read id/K off the b99_decode lines, copy the DECIMAL values into your
+#  bridge variant's substitutions.
 # #############################################################################
 
 substitutions:
   device_name: ceiling-fan-listener
   friendly_name: "Ceiling Fan Listener"
-  pin_rx: "5"                  # GDO0 — identical wiring to the bridge variants
-  listen_freq: "433.92MHz"     # retune here if your remote is off-band
+  pin_rx: "6"                  # GDO2 (proven RX path). "5" = GDO0 fallback for
+                               # boards without the GDO2 wire.
 
 external_components:
   # Same pinned commit as the bridge variants.
@@ -64,6 +58,26 @@ external_components:
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // Route demodulated RX data to GDO2 (RadioLib's async direct mode
+          // only configures GDO0). Harmless surplus when pin_rx is GDO0.
+          id(mycc1101).radio.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG2,
+                                            RADIOLIB_CC1101_GDOX_SERIAL_DATA_ASYNC, 5, 0);
+          // Re-apply the saved listen frequency (the number restores from
+          // flash; the component config only sets the first-boot default).
+          const float f = id(listen_freq).state;
+          if (!std::isnan(f) && f >= 300.0f && f <= 928.0f) {
+            id(mycc1101)._freq = f;
+            id(mycc1101).setup_direct_mode();   // registers + re-enter RX
+            id(mycc1101).radio.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG2,
+                                              RADIOLIB_CC1101_GDOX_SERIAL_DATA_ASYNC, 5, 0);
+          }
+          ESP_LOGI("listener", "listening at %.3f MHz on GPIO%d (%s mode)",
+                   id(mycc1101)._freq, ${pin_rx},
+                   id(raw_mode).state ? "RAW" : "DECODE");
 
 esp32:
   board: esp32-s3-devkitm-1
@@ -82,6 +96,9 @@ ota:
   - platform: esphome
     on_begin:
       - lambda: id(mycc1101).standby();
+    # A failed OTA keeps running with the radio in standby — recover RX.
+    on_error:
+      - lambda: id(mycc1101).recv();
 
 web_server:
   port: 80
@@ -95,28 +112,63 @@ spi:
   mosi_pin: GPIO11
   miso_pin: GPIO13
 
-# The component enters receive mode by itself at setup (setup_direct_mode()
-# ends in recv()), so no boot hook is needed. rx_pin is deliberately NOT set:
-# it only feeds the component's opportunistic RSSI sampling (we read RSSI over
-# SPI ourselves below), and leaving it out guarantees nothing but the
-# remote_receiver's RMT channel ever touches GPIO5. The demodulated data
-# appears on GDO0 by CC1101 register configuration regardless (RadioLib
-# directMode async: IOCFG0 = serial data out).
+# The PROVEN receive configuration (matches the stateful variant): the
+# component enters RX by itself at setup, DRATE 100 + stock SmartRC AGC is
+# the working combo on this hardware, 464 kHz keeps capture odds high for
+# off-center remotes. frequency: is only the first-boot default — runtime
+# tuning goes through the Listen Frequency number + Apply button.
 radiolib_cc1101:
   id: mycc1101
   cs_pin: GPIO10
-  frequency: ${listen_freq}
-  modulation: OOK              # explicit for documentation (also the default)
-  filter: 464kHz               # RX bandwidth (component default; 58-812kHz).
-                               # Wide-open = max capture odds but more noise;
-                               # narrow toward 102-232kHz to quiet noise dumps.
-  bitrate: 10                  # RX sampling ~100us resolution — cleanly separates
-                               # the ~250us and ~760us marks with less noise than
-                               # higher rates (component author's RX example value)
+  frequency: 433.92MHz
+  modulation: OOK
+  filter: 464kHz
+  bitrate: 100
 
-# L1: RSSI watcher — logs only on >6 dB movement, so it's quiet at the idle
-# floor and fires when you press the remote nearby. SPI register read; does
-# not touch GPIO5.
+# Either/or output selector — see header.
+switch:
+  - platform: template
+    id: raw_mode
+    name: "Raw Dump Mode"
+    icon: mdi:pulse
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# Runtime frequency tuning. Type a value, then press Apply — the number
+# alone does NOT retune (deliberate: lets you compose a value without the
+# radio chasing every keystroke).
+number:
+  - platform: template
+    id: listen_freq
+    name: "Listen Frequency"
+    icon: mdi:sine-wave
+    unit_of_measurement: "MHz"
+    mode: box
+    min_value: 387        # CC1101 mid band is 387-464 MHz (chip also does
+    max_value: 464        # 300-348 and 779-928; widen these if you need them)
+    step: 0.005           # 5 kHz — fine enough to sweep for an offset remote
+    initial_value: 433.92
+    restore_value: true
+    optimistic: true
+
+button:
+  - platform: template
+    name: "Apply Frequency"
+    icon: mdi:radio-tower
+    on_press:
+      - lambda: |-
+          const float f = id(listen_freq).state;
+          if (std::isnan(f)) return;
+          id(mycc1101)._freq = f;
+          id(mycc1101).setup_direct_mode();   // standby -> registers -> recv()
+          // IOCFG registers survive mode changes, but re-assert for safety.
+          id(mycc1101).radio.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG2,
+                                            RADIOLIB_CC1101_GDOX_SERIAL_DATA_ASYNC, 5, 0);
+          ESP_LOGI("listener", "re-tuned: listening at %.3f MHz", f);
+
+# Carrier-detect layer: logs only on >6 dB movement, so it is quiet at the
+# idle floor and fires when a remote transmits nearby. SPI register read;
+# does not touch the RX pin.
 interval:
   - interval: 100ms
     then:
@@ -139,22 +191,38 @@ remote_receiver:
   # than the longest within-frame space (~750us), or all 10 repeats merge
   # into one oversized capture and the buffer overflows. A flood of
   # "Buffer overflow" means the radio IS hearing the remote — fix idle,
-  # don't chase the RF. 5500us splits cleanly between repeats.
+  # don't chase the RF.
   idle: 5500us
   filter: 120us                # reject sub-bit noise glitches
   buffer_size: 10kb
   tolerance: 35%
-  # L2: raw pulse dumps — ON by default so you can SEE what reaches the pin.
-  # Sporadic noise dumps with no transmission are normal (wide-open RX).
-  # Comment out once b99_decode lines are flowing.
-  dump: raw
   on_raw:
     - lambda: |-
-        // L3: decode one B99/EV1527 frame from a capture chunk. Chunk
-        // anatomy: the sync gap (~7750us low) exceeds idle, so a clean chunk
-        // is [32 bit marks/spaces][next repeat's 250us sync mark], MSB
-        // first. Noise can prepend slivers, so scan for the first window of
-        // 32 consecutive bit-shaped marks rather than requiring alignment.
+        // ---------------- RAW MODE: print the pulse list ----------------
+        // Marks are positive microseconds, spaces negative. Chunked into
+        // readable log lines.
+        if (id(raw_mode).state) {
+          ESP_LOGI("raw", "---- chunk: %u edges ----", (unsigned) x.size());
+          char buf[160];
+          int pos = 0, count = 0;
+          buf[0] = '\0';
+          for (int32_t v : x) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%ld ", (long) v);
+            if (++count % 16 == 0 || pos > 120) {
+              ESP_LOGI("raw", "  %s", buf);
+              pos = 0;
+              buf[0] = '\0';
+            }
+          }
+          if (pos > 0) ESP_LOGI("raw", "  %s", buf);
+          return;
+        }
+        // -------------- DECODE MODE: B99 scan-window decoder --------------
+        // Chunk anatomy: the sync gap (~7750us low) exceeds idle, so a clean
+        // chunk is [32 bit marks/spaces][next repeat's 250us sync mark].
+        // Noise can prepend slivers, so scan for the first window of 32
+        // consecutive bit-shaped marks. Every repeat logs — with a real
+        // press you should see ~10 identical lines (your confidence signal).
         std::vector<int32_t> marks;
         for (int32_t v : x)
           if (v > 0) marks.push_back(v);
@@ -162,28 +230,30 @@ remote_receiver:
                  (unsigned) x.size(), (unsigned) marks.size());
         if (marks.size() < 32) return;   // sync-only chunk or noise sliver
         const int n = (int) marks.size();
-        for (int s = 0; s + 32 <= n; s++) {
-          uint32_t frame = 0;
+        uint32_t frame = 0;
+        bool found = false;
+        for (int s = 0; s + 32 <= n && !found; s++) {
+          uint32_t f = 0;
           bool ok = true;
           for (int i = 0; i < 32; i++) {
             const int32_t m = marks[s + i];
-            if (m < 100 || m > 1000) { ok = false; break; }  // not bit-shaped
-            frame = (frame << 1) | (m > 500 ? 1u : 0u);
+            if (m < 100 || m > 1000) { ok = false; break; }
+            f = (f << 1) | (m > 500 ? 1u : 0u);
           }
-          if (!ok) continue;
-          const uint32_t rid  = frame >> 12;          // 20-bit remote ID
-          const uint8_t  cmd  = (frame >> 7) & 0x1F;  // 5-bit command
-          const uint8_t  cnt  = (frame >> 4) & 0x7;   // 3-bit rolling counter
-          const uint8_t  csum = frame & 0xF;          // 4-bit checksum
-          // checksum = nibble(bits11-8) ^ nibble(bits7-4) ^ K => solve for K
-          const uint8_t  A = (frame >> 8) & 0xF;
-          const uint8_t  B = (frame >> 4) & 0xF;
-          const uint8_t  K = A ^ B ^ csum;
-          ESP_LOGI("b99_decode",
-                   "frame=0x%08X id=0x%05X (%u) cmd=0x%02X cnt=%u csum=0x%X -> K=0x%X (%u) rssi=%.0fdBm%s",
-                   (unsigned) frame, (unsigned) rid, (unsigned) rid,
-                   (unsigned) cmd, (unsigned) cnt, (unsigned) csum,
-                   (unsigned) K, (unsigned) K, id(mycc1101).getRSSI(),
-                   s == 0 ? "" : " (offset-aligned)");
+          if (ok) { frame = f; found = true; }
+        }
+        if (!found) {
+          ESP_LOGD("b99_decode", "no bit-shaped 32-mark window — flip Raw Dump Mode on to inspect");
           return;
         }
+        const uint32_t rid  = frame >> 12;          // 20-bit remote ID
+        const uint8_t  cmd  = (frame >> 7) & 0x1F;  // 5-bit command
+        const uint8_t  cnt  = (frame >> 4) & 0x7;   // 3-bit rolling counter
+        const uint8_t  csum = frame & 0xF;          // 4-bit checksum
+        // checksum = nibble(bits11-8) ^ nibble(bits7-4) ^ K  =>  solve for K
+        const uint8_t  K = ((frame >> 8) & 0xF) ^ ((frame >> 4) & 0xF) ^ csum;
+        ESP_LOGI("b99_decode",
+                 "frame=0x%08X id=0x%05X (%u) cmd=0x%02X cnt=%u csum=0x%X -> K=0x%X (%u) rssi=%.0fdBm",
+                 (unsigned) frame, (unsigned) rid, (unsigned) rid,
+                 (unsigned) cmd, (unsigned) cnt, (unsigned) csum,
+                 (unsigned) K, (unsigned) K, id(mycc1101).getRSSI());
