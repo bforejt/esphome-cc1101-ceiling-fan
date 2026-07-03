@@ -66,6 +66,11 @@
 #      IOCFG registers persist across TX/RX state changes; one set per boot.
 #    - remote_receiver (GPIO6) decodes B99 frames with the same scan-window
 #      decoder as the standalone listener.
+#    - RX/TX bitrate split: the radio parks in RX at DRATE 10 (OOK slicer
+#      windows sized for our ~1.3 kbps signal — weak remotes shred at 100);
+#      tx_send asserts 100 before each transmit for 1.25us async-input
+#      resolution, and on_complete restores 10. See the radiolib_cc1101
+#      block comment.
 #    - Frames from OUR remotes (ID + checksum-K must BOTH match) update the
 #      entities through the suppressed state-sync path (no re-transmit); the
 #      native API pushes the change to Home Assistant live.
@@ -190,9 +195,12 @@ ota:
       - lambda: id(mycc1101).standby();
     # A successful OTA reboots (on_boot re-arms everything), but a FAILED or
     # aborted OTA keeps running with the radio parked in standby — RX would
-    # go silently deaf until the next transmit. Recover explicitly.
+    # go silently deaf until the next transmit. Recover explicitly, restoring
+    # the RX data rate in case the OTA began mid-transmit (bitrate was 100).
     on_error:
-      - lambda: id(mycc1101).recv();
+      - lambda: |-
+          id(mycc1101)._bitrate = 10;
+          id(mycc1101).setup_direct_mode();
 
 web_server:
   port: 80
@@ -231,14 +239,25 @@ remote_transmitter:
   on_complete:
     then:
       - lambda: |-
-          id(mycc1101).recv();
+          // Restore the RX data rate and re-park in receive.
+          // setup_direct_mode() re-applies registers and ends in recv().
+          id(mycc1101)._bitrate = 10;
+          id(mycc1101).setup_direct_mode();
           id(radio_txing) = false;
           id(tx_last_ms) = millis();
 
 radiolib_cc1101:
   id: mycc1101
   cs_pin: GPIO10
-  bitrate: 100
+  # RX/TX bitrate split. This config value is the RECEIVE (parked) data rate:
+  # the CC1101's OOK decision machinery works over windows derived from the
+  # DRATE register, so receiving a ~1.3 kbps signal with DRATE=100k makes the
+  # slicer trigger-happy on noise (weak remotes shred; see DN022 + component
+  # author's own RX examples, which use 10). TX still needs 100 for fine
+  # async-input sampling (8x DRATE = 1.25us edge resolution on our marks):
+  # tx_send asserts _bitrate=100 before each transmit, and the on_complete
+  # hook restores 10 before parking back in RX.
+  bitrate: 10
   # RX data is routed to GDO2/GPIO6 by the IOCFG2 write in on_boot (RadioLib
   # only configures GDO0, which TX owns). rx_pin is deliberately NOT set: it
   # only feeds the component's opportunistic RSSI sampling, and leaving it
@@ -340,8 +359,12 @@ script:
       freq: float
     then:
       - lambda: |-
-          // Tune the CC1101 to THIS unit's carrier frequency before transmitting.
+          // Tune the CC1101 to THIS unit's carrier frequency before
+          // transmitting, and assert the TX data rate (100 -> 8x oversample
+          // = 1.25us async-input resolution; bench-proven). The on_complete
+          // hook restores the RX data rate after the transmit.
           id(mycc1101)._freq = freq;
+          id(mycc1101)._bitrate = 100;
           id(mycc1101).setup_direct_mode();
           const int MARK_1  = 759, SPACE_1 = 243;   // bit 1 (3:1)
           const int MARK_0  = 251, SPACE_0 = 749;   // bit 0 (1:3)
