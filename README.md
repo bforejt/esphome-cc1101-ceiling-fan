@@ -610,8 +610,10 @@ and replace ours (see [Capturing](#capturing--decoding-your-remote)), and
 most adopters will go further — one fan instead of two, a third fan (a
 substitution pair, a counter global, and one more repeated section),
 different pins, a different board, maybe a different frequency. Expect to
-read the config and adjust it to your situation; it is provided **without
-any promise that it works out of the box**.
+read the config and adjust it to your situation — **unmodified, this will
+not work for your purposes, period.** It transmits *our* remotes' codes to
+*our* fans; at best, out of the box it controls nothing, and if you happen
+to be in RF range of our house, please don't.
 
 **Found an improvement or a variation? Two good ways to share it:**
 
