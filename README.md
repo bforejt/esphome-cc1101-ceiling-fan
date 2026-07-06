@@ -19,6 +19,11 @@ solution and the four separate things that had to be fixed to get there, plus a
 detailed account of **what is proven vs. what is inferred**, so the next person
 doesn't repeat the loops.
 
+Everything here is a **reference implementation provided as-is — anyone using
+any of it does so entirely at their own risk**. Parts of the overall system
+(the fan controller) are mains-powered equipment installed in buildings. See
+[License and disclaimer](#license-and-disclaimer).
+
 ---
 
 ## Two variants
@@ -715,3 +720,38 @@ to be in RF range of our house, please don't.
 - The "missing header" insight was corroborated by a Home Assistant community
   thread describing the identical receive-works/transmit-fails symptom on
   ESP32+CC1101, diagnosed as a missing sync header.
+
+---
+
+## License and disclaimer
+
+Licensed under **Apache 2.0** — see [LICENSE](LICENSE). Per its Sections 7
+and 8, the software is provided **"AS IS", without warranties or conditions
+of any kind**, and the authors accept **no liability** for damages of any
+kind arising from its use. The notes below restate the practical points;
+the LICENSE controls.
+
+**Use entirely at your own risk.** This repository is a reference
+implementation and working demonstration, not a product. Nothing in it is
+professional advice — electrical, legal, or otherwise.
+
+- **Mains voltage.** The fan controller this project talks to is
+  line-voltage equipment installed in buildings. **Nothing in this
+  repository involves or instructs mains wiring** — every instruction here
+  concerns 3.3 V bench electronics. Installing, replacing, or servicing fan
+  controllers or fixtures involves lethal voltages: have that work done by a
+  licensed electrician where required, and comply with your local electrical
+  code. Mistakes with mains wiring can cause fire, injury, or death.
+- **You are switching real machinery.** This code remotely starts and stops
+  motors and lights, with no acknowledgment channel and (per the
+  [documented limits](#the-stateful-variant)) imperfect state certainty. You
+  are responsible for ensuring that remotely or automatically operating
+  *your* equipment is safe in *your* circumstances — including a fan
+  starting when nobody expected it to.
+- **Radio transmissions.** You are responsible for complying with the radio
+  regulations that apply in your country when transmitting on 433 MHz or
+  any other frequency.
+- **No affiliation.** This project is not affiliated with, or endorsed by,
+  any fan, controller, chip, or module manufacturer named here; all
+  trademarks belong to their owners. Control only equipment you own or are
+  authorized to operate.
