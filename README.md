@@ -89,8 +89,8 @@ reproduces.
 
 ### Wiring
 
-Single-pin transmit topology (this is **required** — see
-[Fix #3](#fix-3-single-pin-wiring-required-for-transmit)):
+Transmit rides **GDO0** with open-drain + pullup (this is **required** — see
+[Fix #3](#fix-3-the-transmit-pin--gdo0-open-drain--pullup)):
 
 ```
 CC1101            ESP32-S3
@@ -325,15 +325,29 @@ RadioLib external component instead.** This is why the dependency is mandatory.
 
 > **Proven.** With RadioLib, transmit works; with the stock component, it didn't.
 
-### Fix #3: Single-pin wiring (required for transmit)
+### Fix #3: The transmit pin — GDO0, open-drain + pullup
 
-With the RadioLib component on this hardware, transmit only works with
-**single-pin wiring**: GDO0 = GPIO5 carries the data, configured **open-drain +
-pullup**. A dual-pin attempt (separate GDO2 = GPIO6) would **not actuate** the fan.
+During bring-up, transmit only worked once all transmit signaling rode one
+pin: **GDO0 = GPIO5, configured open-drain + pullup**. An early attempt to
+split the radio across two data pins would not actuate the fan, and this fix
+was originally recorded as "single-pin wiring required."
 
-> **Proven for transmit on our hardware.** We did *not* exhaustively prove a
-> dedicated RX-on-GDO2 path fails for *receive* — only that splitting TX off GPIO5
-> broke transmit. If you only need TX (this repo), use single-pin and move on.
+Later work sharpened what was really going on. Two things are load-bearing:
+
+- **TX data can only enter the CC1101 through GDO0.** This is a chip-level
+  property of async serial mode — no wiring or register choice can move it.
+- **The ESPHome side must drive that pin open-drain + pullup** (the pin mode
+  shipped in every config here).
+
+A second data pin was never the problem: the stateful variant now runs
+**RX on GDO2 → GPIO6 alongside TX on GDO0 → GPIO5, in production**. The
+early dual-pin failure was the transmit path being disturbed, not the
+presence of GDO2.
+
+> **Actionable:** wire GDO0 to your TX GPIO and keep `remote_transmitter`'s
+> open-drain + pullup pin mode exactly as shipped. If transmit stops
+> actuating after wiring or config changes, this pin is debugging
+> checkpoint #3. Adding GDO2 for receive is safe — we ship that.
 
 ### Fix #4 — THE DECIDER: the EV1527/PT2262 sync header
 
@@ -657,7 +671,10 @@ to be in RF range of our house, please don't.
 
 **Proven (measured/observed on our hardware):**
 - RadioLib transmit works where the stock ESPHome component doesn't.
-- Single-pin wiring transmits; splitting TX off GPIO5 broke transmit.
+- TX rides GDO0 with open-drain + pullup; disturbing that path broke
+  transmit during bring-up. RX on GDO2 runs alongside it in the stateful
+  variant (TX data entering only via GDO0 is a chip-level property of the
+  CC1101's async serial mode).
 - The sync header is required; ≥4000 µs gap works, 3750 µs fails (our unit).
 - The 32-bit frame layout, bit timings, and checksum formula (verified against
   many captures decoding self-consistently).
