@@ -246,6 +246,15 @@ DevKitC-1 v1.0 boards = GPIO38). A WS2812 can't be probed at runtime, but
 driving a pin with no LED attached is harmless — boards without one can keep
 the feature or delete the five blocks fenced `STATUS-LED (n/5)` in the YAML.
 
+An **external NeoPixel works identically**: wire its DIN to any free
+output-capable GPIO (avoid this project's 5/6/10–13 and the S3's flash pins
+26–32) and point `pin_status_led` at it. The ESP drives 3.3 V data — power
+the pixel from 3V3 (fine for an indicator) or level-shift if you run it at
+5 V; a ~330 Ω series resistor on the data line is good practice off-board.
+If colors come out swapped, adjust `rgb_order`; other chipsets are a
+`chipset:` change, and a multi-LED strip just floods one color
+(`num_leds: N`).
+
 > Please note if you adapt this: the LED entry pins `rmt_symbols: 48`. The
 > `esp32_rmt_led_strip` default on the S3 is 192 — the chip's **entire** RMT
 > transmit memory pool — which starves `remote_transmitter` at boot
