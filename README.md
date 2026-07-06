@@ -602,6 +602,35 @@ Two gotchas if you go the package route:
 
 ---
 
+## Adapting it, and contributing back
+
+**This repo is a working demonstration, not turnkey firmware.** Nobody can
+flash it unmodified: at minimum you must capture your own remotes' `id`/`K`
+and replace ours (see [Capturing](#capturing--decoding-your-remote)), and
+most adopters will go further — one fan instead of two, a third fan (a
+substitution pair, a counter global, and one more repeated section),
+different pins, a different board, maybe a different frequency. Expect to
+read the config and adjust it to your situation; it is provided **without
+any promise that it works out of the box**.
+
+**Found an improvement or a variation? Two good ways to share it:**
+
+- **Issues are welcome**, especially ones that spell out an opportunity: a
+  fan family that behaves differently, timings that differ from ours, a
+  receiver quirk, a cleaner way to do something. Even when nothing merges,
+  a well-written issue documents the variation for the next person who
+  shows up with your hardware — that alone is a contribution.
+- **PRs are welcome too, with one understanding: we only merge what we can
+  test in practice on our own fans and modules.** RF behavior has burned
+  this project too many times to take a change on faith — twice in the git
+  history, register changes that looked correct on paper went completely
+  deaf on the bench. A PR we can't exercise ourselves will likely stay open
+  as documented reference rather than merge, which still has value; if you
+  want it merged, keep it testable on the hardware described in
+  [Hardware](#hardware).
+
+---
+
 ## Roadmap / known gaps
 
 - **RX state-tracking: shipped in the stateful variant** (GDO2 → GPIO6), a
