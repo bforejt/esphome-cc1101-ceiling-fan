@@ -227,6 +227,31 @@ HA-side config.
 **What HA sees per fan:** `fan.<name>_fan`, `light.<name>_light`, and buttons
 for Timer 1h/2h/4h, All Off, and a diagnostic "Light State Invert".
 
+**Onboard status LED (optional).** The stateful variant drives the ESP32-S3
+dev board's onboard WS2812 as a device-status indicator (`internal: true` —
+it never appears in HA):
+
+| Color | Meaning |
+|---|---|
+| red | a component is in error state |
+| yellow | a component warning |
+| orange | Wi-Fi down |
+| cyan pulse (~1.5 s) | RX decoded a wall-remote press |
+| white pulse (~0.6 s) | transmitting |
+| blue | Wi-Fi up, no HA client connected |
+| dim green | healthy |
+
+The data pin is the `pin_status_led` substitution (DevKitM-1 = GPIO48; some
+DevKitC-1 v1.0 boards = GPIO38). A WS2812 can't be probed at runtime, but
+driving a pin with no LED attached is harmless — boards without one can keep
+the feature or delete the five blocks fenced `STATUS-LED (n/5)` in the YAML.
+
+> Please note if you adapt this: the LED entry pins `rmt_symbols: 48`. The
+> `esp32_rmt_led_strip` default on the S3 is 192 — the chip's **entire** RMT
+> transmit memory pool — which starves `remote_transmitter` at boot
+> (`no free tx channels`, radio TX dead, LED red). The failure only appears
+> at runtime, never at compile time.
+
 **How it transmits.** All fan logic lives in one *reconciler* per fan: on every
 entity state change it diffs the commanded state against the assumed physical
 state and transmits only the differences (the protocol is mostly absolute, so
