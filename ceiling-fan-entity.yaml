@@ -531,8 +531,7 @@ output:
 
 light:
   # ---- STATUS-LED (3/5, optional) — the onboard WS2812, internal (not a
-  # ---- user light; painted by the interval below). Uses one spare RMT TX
-  # ---- channel (S3 has four).
+  # ---- user light; painted by the interval below).
   - platform: esp32_rmt_led_strip
     id: status_rgb
     name: "Status LED"
@@ -543,6 +542,12 @@ light:
     rgb_order: GRB
     restore_mode: ALWAYS_OFF
     default_transition_length: 0s
+    # CRITICAL: the S3 default here is 192 = ALL FOUR RMT TX channels' memory
+    # (48 x 4). Left at default, this single LED starves remote_transmitter
+    # ("no free tx channels" -> remote_transmitter marked FAILED -> no radio
+    # TX, and the LED itself turns red reporting it). One 48-symbol block is
+    # ample for a single WS2812 (24 bits + reset).
+    rmt_symbols: 48
   - platform: binary
     id: office_light
     name: "Office Light"
