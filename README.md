@@ -133,7 +133,7 @@ variant, leave GDO2 unconnected.
 |------|------|
 | `ceiling-fan-radio.yaml` | The **stateless** variant: two fans (Office, Guest) as repeated button blocks sharing one transmit engine. The minimal reference — also the protocol-provenance record. |
 | `ceiling-fan-entity.yaml` | The **stateful** variant: native fan + light entities per fan, on-device assumed state, same transmit engine. See [The stateful variant](#the-stateful-variant). |
-| `ceiling-fan-listener.yaml` | **Capture tool**, not a bridge: receive-only config with a raw-vs-decode output toggle and runtime-tunable listen frequency. Decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. Flash temporarily to extract your remote's values. See [Method A](#method-a--flash-the-shipped-listener). |
+| `ceiling-fan-listener.yaml` | **Capture tool**, not a bridge: receive-only config with a raw-vs-decode output toggle and runtime-tunable listen frequency. Decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. Flash temporarily to extract your remote's values. See [Plan A](#plan-a--let-the-firmware-decode-for-you-recommended). |
 
 > Both configs are intentionally **single readable flat files** with some
 > repetition between fans, rather than clever multi-file packages. See
@@ -458,10 +458,31 @@ If it doesn't match, stop here; this won't work without re-deriving the protocol
 
 ## Capturing & decoding your remote
 
-You need your remote's **20-bit ID** and **checksum key `K`**. Two capture methods
-worked for us.
+You need your remote's **20-bit ID** and **checksum key `K`** — and there is
+no list to look them up in. In the EV1527 scheme the ID is **factory-burned
+into each individual remote**, so no manufacturer document can contain *your*
+values even in principle (our own research into the B99 OEM turned up no
+protocol documentation of any kind). An **over-the-air capture of your remote
+is required no matter what** — the only question is who does the decoding:
+the firmware (Plan A) or you with help (Plan B).
 
-### Method A — flash the shipped listener
+The `ceiling-fan-listener.yaml` tool exists to make Plan A as easy as
+possible, and to be this project's bench instrument — raw pulse dumps,
+runtime frequency tuning, and room for more capture/test knobs over time.
+Please note the listener is a **work in progress**: receive reliability is
+still being hardened across radio-module variants. The stateful entity
+variant carries the same decoder, so it works as a discovery tool too.
+
+### Plan A — let the firmware decode for you (recommended)
+
+Either config decodes B99 frames off the air and hands you the values:
+
+- **The entity variant**: press any *unknown* remote near the device and it
+  logs a `rx_discover` line with the decoded `id`, `cmd`, `cnt`, and solved
+  `K` — you can onboard a new remote without leaving the production
+  firmware.
+- **The listener** (details below): the dedicated tool, with raw dumps and
+  frequency tuning for the harder cases.
 
 The repo ships `ceiling-fan-listener.yaml`: a receive-only config using the
 same **proven receive chain** as the stateful variant (RX data on
@@ -496,12 +517,40 @@ To extract a remote's values:
    increment by one per press, mod 8.
 4. Copy the decimal `id` and `K` into your bridge variant's `substitutions:`.
 
-If your remote is **not** a B99 (decodes look wrong, `K` inconsistent), flip
-**Raw Dump Mode** on and decode the pulse lists by hand: each **mark**
-(positive µs) > ~500 µs is a `1`, else `0`; assemble 32 bits MSB-first, then
-split per the [frame layout](#the-protocol-validated). The repeats are noisy
-at the edges — look for the cleanest 32-mark frame. Sporadic noise chunks
-with no transmission are normal for a wide-open OOK receiver.
+If decode lines are inconsistent or absent — a weak, off-frequency, or
+non-B99 remote (the fan's purpose-built receiver is far more forgiving than
+our CC1101) — move to Plan B.
+
+### Plan B — raw captures + an LLM (noisy remotes, unknown protocols)
+
+When the firmware can't decode cleanly, collect **raw pulse captures** and
+let a frontier LLM do the alignment work. This is not hypothetical: one of
+this project's own remotes arrives too noisy for the on-device decoder, yet
+enough raw captures gave an LLM the redundancy to align the frames and
+recover the ID and `K` correctly.
+
+1. **Capture raw.** Flip the listener's **Raw Dump Mode** on (or use a
+   custom sniffer variant, or an SDR — below) and record **many presses of
+   known buttons in a noted order** — e.g., Light ×3, Speed 1 ×3, Speed 2 ×3.
+   Each press yields ~10 repeats; redundancy is what makes noisy data
+   solvable. Sporadic noise chunks with no transmission are normal for a
+   wide-open OOK receiver — capture through them.
+2. **Hand the LLM three things:** the raw pulse lists, the button order you
+   pressed, and this README's [protocol section](#the-protocol-validated)
+   (frame layout, bit geometry, checksum formula, and the worked example).
+3. **Ask it to:** convert marks > ~500 µs to `1` and shorter marks to `0`,
+   assemble 32-bit frames MSB-first, discard chunks that don't fit, split
+   the fields, solve `K` per frame, and cross-check — `K` must be one
+   constant across all buttons, the counter must increment by one per press
+   (mod 8), and the decoded commands must match the
+   [command map](#command-map-5-bit-identical-across-b99-units) for the
+   buttons you pressed.
+4. **Validate** the answer against the worked checksum example, then flash a
+   bridge variant with the derived `id`/`K` and confirm the fan actuates.
+
+Decoding by hand works the same way if you prefer: each **mark**
+(positive µs) > ~500 µs is a `1`, else `0`; 32 bits MSB-first; look for the
+cleanest 32-mark frames among the repeats.
 
 > **Gotcha we hit (documented so you don't):** the receiver's `idle` must be
 > *shorter* than the ≈7750 µs inter-frame sync gap but *longer* than the
@@ -511,7 +560,7 @@ with no transmission are normal for a wide-open OOK receiver.
 > and **zero** decoded frames. That flood means the radio *is hearing the
 > remote* — it's a frame-delimiting problem, not a reception failure.
 
-### Method B — RTL-SDR + Universal Radio Hacker (URH)
+#### Alternative raw-capture instrument: RTL-SDR + Universal Radio Hacker
 
 If you own an SDR (we used a NooElec NESDR), this is more turnkey for *seeing* the
 full envelope including the sync gap that a CC1101 listener tends to mangle:
