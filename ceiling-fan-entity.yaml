@@ -119,6 +119,12 @@ substitutions:
   green_id_dec: "6480"         # 20-bit ID 0x01950 (captured via rx_discover)
   green_k: "7"                 # checksum key 0x7 (validated across many frames)
   green_freq_mhz: "433.92"     # remote received cleanly at 433.92 (RSSI -74dBm)
+  # ---- STATUS-LED (1/5, optional) -----------------------------------------
+  # Onboard WS2812 data pin: ESP32-S3-DevKitM-1 = GPIO48 (per Espressif's
+  # user guide); some DevKitC-1 v1.0 boards = GPIO38. A WS2812 cannot be
+  # probed at runtime, but driving a pin with no LED attached is harmless —
+  # boards without the LED can keep or delete the five STATUS-LED sections.
+  pin_status_led: "48"
 
 external_components:
   # Pinned commit (repo has no tags). Verified to expose the API we use:
@@ -362,6 +368,12 @@ globals:
     restore_value: false
     initial_value: 'false'
   - id: tx_last_ms              # last TX activity (millis); RX quiet-window gate
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # ---- STATUS-LED (2/5, optional) — last accepted RX press (millis). The
+  # ---- write in the RX dispatch is harmless if the LED sections are removed.
+  - id: rx_last_ms
     type: uint32_t
     restore_value: false
     initial_value: '0'
@@ -618,6 +630,24 @@ output:
           id(green_light_on) = state;
 
 light:
+  # ---- STATUS-LED (3/5, optional) — the onboard WS2812, internal (not a
+  # ---- user light; painted by the interval below).
+  - platform: esp32_rmt_led_strip
+    id: status_rgb
+    name: "Status LED"
+    internal: true
+    pin: ${pin_status_led}
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+    # CRITICAL: the S3 default here is 192 = ALL FOUR RMT TX channels' memory
+    # (48 x 4). Left at default, this single LED starves remote_transmitter
+    # ("no free tx channels" -> remote_transmitter marked FAILED -> no radio
+    # TX, and the LED itself turns red reporting it). One 48-symbol block is
+    # ample for a single WS2812 (24 bits + reset).
+    rmt_symbols: 48
   - platform: binary
     id: office_light
     name: "Office Light"
@@ -633,6 +663,44 @@ light:
     name: "Green Light"
     output: green_light_out
     restore_mode: RESTORE_DEFAULT_OFF
+
+# ---- STATUS-LED (4/5, optional) — the painter. Priority order: component
+# ---- error (red) > warning (yellow) > wifi down (orange) > RX decoded
+# ---- (cyan, ~1.5s) > transmitting (white, ~0.6s) > no HA client (blue) >
+# ---- healthy (dim green). Event colors self-restore on the next tick; the
+# ---- state cache keeps this from spamming light calls every 250ms.
+interval:
+  - interval: 250ms
+    then:
+      - lambda: |-
+          static uint8_t last_state = 255;
+          const uint32_t ms = millis();
+          const uint8_t app = App.get_app_state();
+          uint8_t s;
+          if (app & STATUS_LED_ERROR)                                    s = 0;
+          else if (app & STATUS_LED_WARNING)                             s = 1;
+          else if (!wifi::global_wifi_component->is_connected())         s = 2;
+          else if (id(rx_last_ms) != 0 && ms - id(rx_last_ms) < 1500)    s = 3;
+          else if (id(tx_last_ms) != 0 && ms - id(tx_last_ms) < 600)     s = 4;
+          else if (!api::global_api_server->is_connected())              s = 5;
+          else                                                           s = 6;
+          if (s == last_state) return;
+          last_state = s;
+          float r = 0, g = 0, b = 0, br = 0.30f;
+          switch (s) {
+            case 0: r = 1;                          break;  // red: error
+            case 1: r = 1; g = 0.6f;                break;  // yellow: warning
+            case 2: r = 1; g = 0.25f;               break;  // orange: wifi down
+            case 3: g = 1; b = 1;    br = 0.50f;    break;  // cyan: RX press
+            case 4: r = 1; g = 1; b = 1; br = 0.5f; break;  // white: TX
+            case 5: b = 1;                          break;  // blue: no HA client
+            case 6: g = 1;           br = 0.08f;    break;  // dim green: healthy
+          }
+          auto call = id(status_rgb).turn_on();
+          call.set_transition_length(0);
+          call.set_rgb(r, g, b);
+          call.set_brightness(br);
+          call.perform();
 
 # -----------------------------------------------------------------------------
 # RAW BUTTONS. Rule: raw buttons never route through entity calls; each owns
@@ -967,6 +1035,9 @@ remote_receiver:
         if (frame == last_frame && (now - last_ms) < 2000) { last_ms = now; return; }
         last_frame = frame;
         last_ms = now;
+        // STATUS-LED (5/5, optional): note the accepted press for the LED
+        // painter; harmless if the LED sections are removed.
+        id(rx_last_ms) = now;
 
         // ---- Per-unit handles (globals are references; entities are the
         // same template types for both fans).
