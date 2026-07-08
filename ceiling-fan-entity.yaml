@@ -84,7 +84,7 @@
 #      the demodulator is off): radio_txing flag + a 1.2 s post-TX quiet
 #      window (tx_last_ms), plus whole-frame dedup (~10 repeats per press,
 #      counter increments per press) so one press = one action.
-#    - STATUS: working with both of the author's fans. RELIABLE DECODE NEEDS
+#    - STATUS: working with the author's three fans. RELIABLE DECODE NEEDS
 #      A CLEAN SIGNAL — one remote decodes perfectly; the other operates its
 #      fan fine but arrives too noisy for consistent decode (the fan's
 #      purpose-built receiver is more forgiving than our CC1101). Register

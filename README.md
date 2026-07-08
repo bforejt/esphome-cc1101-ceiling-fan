@@ -280,8 +280,10 @@ mirrored into the entities — no re-transmit — and Home Assistant updates liv
 the rolling counter also resyncs so our next transmit continues the remote's
 sequence. Presses from **unknown** remotes are logged (tag `rx_discover`) with
 their decoded `id` and `K` — which is how you onboard a new remote straight
-from the web-page log. Validated with the two fans this repo was built
-against.
+from the web-page log. This is not hypothetical: the shipped config's **third
+fan was added exactly this way** — a new controller's `rx_discover` line gave
+its `id` and `K`, which dropped straight into a new fan block. Validated with
+all three of the author's fans.
 
 The **goal** is to keep all three parties — the fan controller, the physical
 remote, and this ESP — in sync where possible. Please note the limits:
