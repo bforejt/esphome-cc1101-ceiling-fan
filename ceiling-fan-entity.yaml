@@ -115,7 +115,7 @@ substitutions:
   guest_id_dec: "100761"      # 20-bit ID 0x18999
   guest_k: "10"               # checksum key 0xA
   guest_freq_mhz: "433.92"    # verified working
-  # --- Green Room fan (unit 2) ---
+  # --- Green fan (unit 2) ---
   green_id_dec: "6480"         # 20-bit ID 0x01950 (captured via rx_discover)
   green_k: "7"                 # checksum key 0x7 (validated across many frames)
   green_freq_mhz: "433.92"     # remote received cleanly at 433.92 (RSSI -74dBm)
@@ -172,7 +172,7 @@ esphome:
             }
             call.perform();
           }
-          {  // Green Room fan
+          {  // Green fan
             auto call = id(green_fan).make_call();
             call.set_state(id(green_fan_on));
             call.set_direction(id(green_fan_fwd) ? fan::FanDirection::FORWARD
@@ -331,7 +331,7 @@ globals:
     type: bool
     restore_value: true
     initial_value: 'false'
-  # --- Assumed physical state, Green Room ---
+  # --- Assumed physical state, Green ---
   - id: green_fan_on
     type: bool
     restore_value: true
@@ -540,7 +540,7 @@ fan:
 
   - platform: template
     id: green_fan
-    name: "Green Room Fan"
+    name: "Green Fan"
     speed_count: 6
     has_direction: true
     preset_modes:
@@ -630,7 +630,7 @@ light:
     restore_mode: RESTORE_DEFAULT_OFF
   - platform: binary
     id: green_light
-    name: "Green Room Light"
+    name: "Green Light"
     output: green_light_out
     restore_mode: RESTORE_DEFAULT_OFF
 
@@ -781,9 +781,9 @@ button:
           else                    id(guest_light).turn_off().perform();
           id(suppress_tx) = false;
 
-  # ============================ GREEN ROOM (unit 2) =============================
+  # ============================ GREEN (unit 2) =============================
   - platform: template
-    name: "Green Room Timer 1h"
+    name: "Green Timer 1h"
     icon: mdi:timer
     on_press:
       - script.execute:
@@ -794,7 +794,7 @@ button:
           cmd: 2
           freq: ${green_freq_mhz}
   - platform: template
-    name: "Green Room Timer 2h"
+    name: "Green Timer 2h"
     icon: mdi:timer
     on_press:
       - script.execute:
@@ -805,7 +805,7 @@ button:
           cmd: 9
           freq: ${green_freq_mhz}
   - platform: template
-    name: "Green Room Timer 4h"
+    name: "Green Timer 4h"
     icon: mdi:timer
     on_press:
       - script.execute:
@@ -816,7 +816,7 @@ button:
           cmd: 25
           freq: ${green_freq_mhz}
   - platform: template
-    name: "Green Room All Off"
+    name: "Green All Off"
     icon: mdi:power-off
     on_press:
       - script.execute:
@@ -835,7 +835,7 @@ button:
           id(green_light).turn_off().perform();
           id(suppress_tx) = false;
   - platform: template
-    name: "Green Room Light State Invert"
+    name: "Green Light State Invert"
     icon: mdi:lightbulb-question
     entity_category: diagnostic
     on_press:
