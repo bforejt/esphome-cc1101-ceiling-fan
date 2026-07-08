@@ -19,6 +19,11 @@ solution and the four separate things that had to be fixed to get there, plus a
 detailed account of **what is proven vs. what is inferred**, so the next person
 doesn't repeat the loops.
 
+Everything here is a **reference implementation provided as-is — anyone using
+any of it does so entirely at their own risk**. Parts of the overall system
+(the fan controller) are mains-powered equipment installed in buildings. See
+[License and disclaimer](#license-and-disclaimer).
+
 ---
 
 ## Two variants
@@ -89,8 +94,8 @@ reproduces.
 
 ### Wiring
 
-Single-pin transmit topology (this is **required** — see
-[Fix #3](#fix-3-single-pin-wiring-required-for-transmit)):
+Transmit rides **GDO0** with open-drain + pullup (this is **required** — see
+[Fix #3](#fix-3-the-transmit-pin--gdo0-open-drain--pullup)):
 
 ```
 CC1101            ESP32-S3
@@ -133,7 +138,7 @@ variant, leave GDO2 unconnected.
 |------|------|
 | `ceiling-fan-radio.yaml` | The **stateless** variant: two fans (Office, Guest) as repeated button blocks sharing one transmit engine. The minimal reference — also the protocol-provenance record. |
 | `ceiling-fan-entity.yaml` | The **stateful** variant: native fan + light entities per fan, on-device assumed state, same transmit engine. See [The stateful variant](#the-stateful-variant). |
-| `ceiling-fan-listener.yaml` | **Capture tool**, not a bridge: receive-only config with a raw-vs-decode output toggle and runtime-tunable listen frequency. Decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. Flash temporarily to extract your remote's values. See [Method A](#method-a--flash-the-shipped-listener). |
+| `ceiling-fan-listener.yaml` | **Capture tool**, not a bridge: receive-only config with a raw-vs-decode output toggle and runtime-tunable listen frequency. Decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. Flash temporarily to extract your remote's values. See [Plan A](#plan-a--let-the-firmware-decode-for-you-recommended). |
 
 > Both configs are intentionally **single readable flat files** with some
 > repetition between fans, rather than clever multi-file packages. See
@@ -359,15 +364,29 @@ RadioLib external component instead.** This is why the dependency is mandatory.
 
 > **Proven.** With RadioLib, transmit works; with the stock component, it didn't.
 
-### Fix #3: Single-pin wiring (required for transmit)
+### Fix #3: The transmit pin — GDO0, open-drain + pullup
 
-With the RadioLib component on this hardware, transmit only works with
-**single-pin wiring**: GDO0 = GPIO5 carries the data, configured **open-drain +
-pullup**. A dual-pin attempt (separate GDO2 = GPIO6) would **not actuate** the fan.
+During bring-up, transmit only worked once all transmit signaling rode one
+pin: **GDO0 = GPIO5, configured open-drain + pullup**. An early attempt to
+split the radio across two data pins would not actuate the fan, and this fix
+was originally recorded as "single-pin wiring required."
 
-> **Proven for transmit on our hardware.** We did *not* exhaustively prove a
-> dedicated RX-on-GDO2 path fails for *receive* — only that splitting TX off GPIO5
-> broke transmit. If you only need TX (this repo), use single-pin and move on.
+Later work sharpened what was really going on. Two things are load-bearing:
+
+- **TX data can only enter the CC1101 through GDO0.** This is a chip-level
+  property of async serial mode — no wiring or register choice can move it.
+- **The ESPHome side must drive that pin open-drain + pullup** (the pin mode
+  shipped in every config here).
+
+A second data pin was never the problem: the stateful variant now runs
+**RX on GDO2 → GPIO6 alongside TX on GDO0 → GPIO5, in production**. The
+early dual-pin failure was the transmit path being disturbed, not the
+presence of GDO2.
+
+> **Actionable:** wire GDO0 to your TX GPIO and keep `remote_transmitter`'s
+> open-drain + pullup pin mode exactly as shipped. If transmit stops
+> actuating after wiring or config changes, this pin is debugging
+> checkpoint #3. Adding GDO2 for receive is safe — we ship that.
 
 ### Fix #4 — THE DECIDER: the EV1527/PT2262 sync header
 
@@ -492,10 +511,31 @@ If it doesn't match, stop here; this won't work without re-deriving the protocol
 
 ## Capturing & decoding your remote
 
-You need your remote's **20-bit ID** and **checksum key `K`**. Two capture methods
-worked for us.
+You need your remote's **20-bit ID** and **checksum key `K`** — and there is
+no list to look them up in. In the EV1527 scheme the ID is **factory-burned
+into each individual remote**, so no manufacturer document can contain *your*
+values even in principle (our own research into the B99 OEM turned up no
+protocol documentation of any kind). An **over-the-air capture of your remote
+is required no matter what** — the only question is who does the decoding:
+the firmware (Plan A) or you with help (Plan B).
 
-### Method A — flash the shipped listener
+The `ceiling-fan-listener.yaml` tool exists to make Plan A as easy as
+possible, and to be this project's bench instrument — raw pulse dumps,
+runtime frequency tuning, and room for more capture/test knobs over time.
+Please note the listener is a **work in progress**: receive reliability is
+still being hardened across radio-module variants. The stateful entity
+variant carries the same decoder, so it works as a discovery tool too.
+
+### Plan A — let the firmware decode for you (recommended)
+
+Either config decodes B99 frames off the air and hands you the values:
+
+- **The entity variant**: press any *unknown* remote near the device and it
+  logs a `rx_discover` line with the decoded `id`, `cmd`, `cnt`, and solved
+  `K` — you can onboard a new remote without leaving the production
+  firmware.
+- **The listener** (details below): the dedicated tool, with raw dumps and
+  frequency tuning for the harder cases.
 
 The repo ships `ceiling-fan-listener.yaml`: a receive-only config using the
 same **proven receive chain** as the stateful variant (RX data on
@@ -530,12 +570,40 @@ To extract a remote's values:
    increment by one per press, mod 8.
 4. Copy the decimal `id` and `K` into your bridge variant's `substitutions:`.
 
-If your remote is **not** a B99 (decodes look wrong, `K` inconsistent), flip
-**Raw Dump Mode** on and decode the pulse lists by hand: each **mark**
-(positive µs) > ~500 µs is a `1`, else `0`; assemble 32 bits MSB-first, then
-split per the [frame layout](#the-protocol-validated). The repeats are noisy
-at the edges — look for the cleanest 32-mark frame. Sporadic noise chunks
-with no transmission are normal for a wide-open OOK receiver.
+If decode lines are inconsistent or absent — a weak, off-frequency, or
+non-B99 remote (the fan's purpose-built receiver is far more forgiving than
+our CC1101) — move to Plan B.
+
+### Plan B — raw captures + an LLM (noisy remotes, unknown protocols)
+
+When the firmware can't decode cleanly, collect **raw pulse captures** and
+let a frontier LLM do the alignment work. This is not hypothetical: one of
+this project's own remotes arrives too noisy for the on-device decoder, yet
+enough raw captures gave an LLM the redundancy to align the frames and
+recover the ID and `K` correctly.
+
+1. **Capture raw.** Flip the listener's **Raw Dump Mode** on (or use a
+   custom sniffer variant, or an SDR — below) and record **many presses of
+   known buttons in a noted order** — e.g., Light ×3, Speed 1 ×3, Speed 2 ×3.
+   Each press yields ~10 repeats; redundancy is what makes noisy data
+   solvable. Sporadic noise chunks with no transmission are normal for a
+   wide-open OOK receiver — capture through them.
+2. **Hand the LLM three things:** the raw pulse lists, the button order you
+   pressed, and this README's [protocol section](#the-protocol-validated)
+   (frame layout, bit geometry, checksum formula, and the worked example).
+3. **Ask it to:** convert marks > ~500 µs to `1` and shorter marks to `0`,
+   assemble 32-bit frames MSB-first, discard chunks that don't fit, split
+   the fields, solve `K` per frame, and cross-check — `K` must be one
+   constant across all buttons, the counter must increment by one per press
+   (mod 8), and the decoded commands must match the
+   [command map](#command-map-5-bit-identical-across-b99-units) for the
+   buttons you pressed.
+4. **Validate** the answer against the worked checksum example, then flash a
+   bridge variant with the derived `id`/`K` and confirm the fan actuates.
+
+Decoding by hand works the same way if you prefer: each **mark**
+(positive µs) > ~500 µs is a `1`, else `0`; 32 bits MSB-first; look for the
+cleanest 32-mark frames among the repeats.
 
 > **Gotcha we hit (documented so you don't):** the receiver's `idle` must be
 > *shorter* than the ≈7750 µs inter-frame sync gap but *longer* than the
@@ -545,7 +613,7 @@ with no transmission are normal for a wide-open OOK receiver.
 > and **zero** decoded frames. That flood means the radio *is hearing the
 > remote* — it's a frame-delimiting problem, not a reception failure.
 
-### Method B — RTL-SDR + Universal Radio Hacker (URH)
+#### Alternative raw-capture instrument: RTL-SDR + Universal Radio Hacker
 
 If you own an SDR (we used a NooElec NESDR), this is more turnkey for *seeing* the
 full envelope including the sync gap that a CC1101 listener tends to mangle:
@@ -587,6 +655,37 @@ Two gotchas if you go the package route:
 
 ---
 
+## Adapting it, and contributing back
+
+**This repo is a working demonstration, not turnkey firmware.** Nobody can
+flash it unmodified: at minimum you must capture your own remotes' `id`/`K`
+and replace ours (see [Capturing](#capturing--decoding-your-remote)), and
+most adopters will go further — one fan instead of two, a third fan (a
+substitution pair, a counter global, and one more repeated section),
+different pins, a different board, maybe a different frequency. Expect to
+read the config and adjust it to your situation — **unmodified, this will
+not work for your purposes, period.** It transmits *our* remotes' codes to
+*our* fans; at best, out of the box it controls nothing, and if you happen
+to be in RF range of our house, please don't.
+
+**Found an improvement or a variation? Two good ways to share it:**
+
+- **Issues are welcome**, especially ones that spell out an opportunity: a
+  fan family that behaves differently, timings that differ from ours, a
+  receiver quirk, a cleaner way to do something. Even when nothing merges,
+  a well-written issue documents the variation for the next person who
+  shows up with your hardware — that alone is a contribution.
+- **PRs are welcome too, with one understanding: we only merge what we can
+  test in practice on our own fans and modules.** RF behavior has burned
+  this project too many times to take a change on faith — twice in the git
+  history, register changes that looked correct on paper went completely
+  deaf on the bench. A PR we can't exercise ourselves will likely stay open
+  as documented reference rather than merge, which still has value; if you
+  want it merged, keep it testable on the hardware described in
+  [Hardware](#hardware).
+
+---
+
 ## Roadmap / known gaps
 
 - **RX state-tracking: shipped in the stateful variant** (GDO2 → GPIO6), a
@@ -611,7 +710,10 @@ Two gotchas if you go the package route:
 
 **Proven (measured/observed on our hardware):**
 - RadioLib transmit works where the stock ESPHome component doesn't.
-- Single-pin wiring transmits; splitting TX off GPIO5 broke transmit.
+- TX rides GDO0 with open-drain + pullup; disturbing that path broke
+  transmit during bring-up. RX on GDO2 runs alongside it in the stateful
+  variant (TX data entering only via GDO0 is a chip-level property of the
+  CC1101's async serial mode).
 - The sync header is required; ≥4000 µs gap works, 3750 µs fails (our unit).
 - The 32-bit frame layout, bit timings, and checksum formula (verified against
   many captures decoding self-consistently).
@@ -652,3 +754,38 @@ Two gotchas if you go the package route:
 - The "missing header" insight was corroborated by a Home Assistant community
   thread describing the identical receive-works/transmit-fails symptom on
   ESP32+CC1101, diagnosed as a missing sync header.
+
+---
+
+## License and disclaimer
+
+Licensed under **Apache 2.0** — see [LICENSE](LICENSE). Per its Sections 7
+and 8, the software is provided **"AS IS", without warranties or conditions
+of any kind**, and the authors accept **no liability** for damages of any
+kind arising from its use. The notes below restate the practical points;
+the LICENSE controls.
+
+**Use entirely at your own risk.** This repository is a reference
+implementation and working demonstration, not a product. Nothing in it is
+professional advice — electrical, legal, or otherwise.
+
+- **Mains voltage.** The fan controller this project talks to is
+  line-voltage equipment installed in buildings. **Nothing in this
+  repository involves or instructs mains wiring** — every instruction here
+  concerns 3.3 V bench electronics. Installing, replacing, or servicing fan
+  controllers or fixtures involves lethal voltages: have that work done by a
+  licensed electrician where required, and comply with your local electrical
+  code. Mistakes with mains wiring can cause fire, injury, or death.
+- **You are switching real machinery.** This code remotely starts and stops
+  motors and lights, with no acknowledgment channel and (per the
+  [documented limits](#the-stateful-variant)) imperfect state certainty. You
+  are responsible for ensuring that remotely or automatically operating
+  *your* equipment is safe in *your* circumstances — including a fan
+  starting when nobody expected it to.
+- **Radio transmissions.** You are responsible for complying with the radio
+  regulations that apply in your country when transmitting on 433 MHz or
+  any other frequency.
+- **No affiliation.** This project is not affiliated with, or endorsed by,
+  any fan, controller, chip, or module manufacturer named here; all
+  trademarks belong to their owners. Control only equipment you own or are
+  authorized to operate.

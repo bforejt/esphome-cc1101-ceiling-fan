@@ -115,6 +115,10 @@ substitutions:
   guest_id_dec: "100761"      # 20-bit ID 0x18999
   guest_k: "10"               # checksum key 0xA
   guest_freq_mhz: "433.92"    # verified working
+  # --- Green fan (unit 2) ---
+  green_id_dec: "6480"         # 20-bit ID 0x01950 (captured via rx_discover)
+  green_k: "7"                 # checksum key 0x7 (validated across many frames)
+  green_freq_mhz: "433.92"     # remote received cleanly at 433.92 (RSSI -74dBm)
   # ---- STATUS-LED (1/5, optional) -----------------------------------------
   # Onboard WS2812 data pin: ESP32-S3-DevKitM-1 = GPIO48 (per Espressif's
   # user guide); some DevKitC-1 v1.0 boards = GPIO38. A WS2812 cannot be
@@ -174,11 +178,25 @@ esphome:
             }
             call.perform();
           }
+          {  // Green fan
+            auto call = id(green_fan).make_call();
+            call.set_state(id(green_fan_on));
+            call.set_direction(id(green_fan_fwd) ? fan::FanDirection::FORWARD
+                                                : fan::FanDirection::REVERSE);
+            if (id(green_fan_on) && id(green_fan_breeze)) {
+              call.set_preset_mode("Breeze");
+            } else {
+              call.set_speed(id(green_fan_speed));
+            }
+            call.perform();
+          }
           // Lights: align entities to assumed state (write_action suppressed).
           if (id(office_light_on)) id(office_light).turn_on().perform();
           else                     id(office_light).turn_off().perform();
           if (id(guest_light_on))  id(guest_light).turn_on().perform();
           else                     id(guest_light).turn_off().perform();
+          if (id(green_light_on))   id(green_light).turn_on().perform();
+          else                     id(green_light).turn_off().perform();
           // ARM transmit — must be the last statement of the boot sync.
           id(suppress_tx) = false;
 
@@ -271,6 +289,10 @@ globals:
     type: uint8_t
     restore_value: true
     initial_value: '0'
+  - id: ctr_green
+    type: uint8_t
+    restore_value: true
+    initial_value: '0'
   # --- Assumed physical state, Office (flash-restored source of truth; the
   # --- fan entity itself uses restore_mode: NO_RESTORE because template-fan
   # --- restore is unreliable on esp-idf) ---
@@ -315,6 +337,27 @@ globals:
     type: bool
     restore_value: true
     initial_value: 'false'
+  # --- Assumed physical state, Green ---
+  - id: green_fan_on
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: green_fan_speed
+    type: uint8_t
+    restore_value: true
+    initial_value: '3'
+  - id: green_fan_fwd
+    type: bool
+    restore_value: true
+    initial_value: 'true'
+  - id: green_fan_breeze
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: green_light_on
+    type: bool
+    restore_value: true
+    initial_value: 'false'
   # --- Guards (never restored) ---
   - id: suppress_tx             # boots TRUE: boot guard + programmatic-sync guard
     type: bool
@@ -341,7 +384,7 @@ globals:
 # executes (slider drags, [Speed, F/R] sequences, both fans at once) and keeps
 # the per-unit retune from firing mid-transmission; the trailing delay holds
 # each run active for the full RF airtime.
-#   unit : 0=office, 1=guest   (selects the per-unit counter)
+#   unit : 0=office, 1=guest, 2=green   (selects the per-unit counter)
 #   id_  : 20-bit fan ID    k : 4-bit checksum key    cmd : 5-bit B99 command
 #   freq : carrier frequency in MHz for THIS unit
 # -----------------------------------------------------------------------------
@@ -370,7 +413,9 @@ script:
           const int SYNC_H  = 250;                  // sync header high
           const int SYNC_L  = ${sync_gap};          // sync header low gap (us)
           const int REPEATS = 10;
-          uint8_t cnt = (unit == 0) ? (id(ctr_office) & 0x7) : (id(ctr_guest) & 0x7);
+          uint8_t cnt = ((unit == 0) ? id(ctr_office)
+                       : (unit == 1) ? id(ctr_guest)
+                                     : id(ctr_green)) & 0x7;
           // Assemble 32-bit frame: [20 id][5 cmd][3 cnt][4 checksum]
           uint32_t v = (((uint32_t)(cmd & 0x1F)) << 7) | ((uint32_t)cnt << 4);
           uint8_t A = (v >> 8) & 0xF;               // nibble bits 11-8
@@ -392,8 +437,9 @@ script:
           call.set_send_times(1);
           call.set_send_wait(0);
           call.perform();
-          if (unit == 0) id(ctr_office) = (cnt + 1) & 0x7;
-          else           id(ctr_guest)  = (cnt + 1) & 0x7;
+          if (unit == 0)      id(ctr_office) = (cnt + 1) & 0x7;
+          else if (unit == 1) id(ctr_guest)  = (cnt + 1) & 0x7;
+          else                id(ctr_green)   = (cnt + 1) & 0x7;
           ESP_LOGD("tx_send", "unit=%d id=0x%05X cmd=0x%02X cnt=%u freq=%.2f frame=0x%08X",
                    unit, (unsigned)(id_ & 0xFFFFF), (unsigned)cmd,
                    (unsigned)cnt, freq, (unsigned)frame);
@@ -504,6 +550,51 @@ fan:
             id(guest_fan_fwd) = want_fwd;
           }
 
+  - platform: template
+    id: green_fan
+    name: "Green Fan"
+    speed_count: 6
+    has_direction: true
+    preset_modes:
+      - "Breeze"
+    restore_mode: NO_RESTORE
+    on_state:
+      - lambda: |-
+          if (id(suppress_tx)) return;
+          auto *f = id(green_fan);
+          const bool want_on  = f->state;
+          const bool want_brz = want_on && f->has_preset_mode();
+          const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
+          int want_spd = f->speed;
+          if (want_spd < 1 || want_spd > 6) want_spd = id(green_fan_speed);
+          static const uint8_t SPD_CMD[7] = {0, 0x10, 0x12, 0x1C, 0x0A, 0x0F, 0x0C};
+
+          if (!want_on) {
+            if (id(green_fan_on)) {
+              id(tx_send).execute(2, ${green_id_dec}, ${green_k}, 0x16, ${green_freq_mhz});
+              id(green_fan_on) = false;
+              id(green_fan_breeze) = false;
+            }
+            return;
+          }
+          if (want_brz) {
+            if (!id(green_fan_breeze) || !id(green_fan_on)) {
+              id(tx_send).execute(2, ${green_id_dec}, ${green_k}, 0x15, ${green_freq_mhz});
+              id(green_fan_on) = true;
+              id(green_fan_breeze) = true;
+            }
+          }
+          else if (!id(green_fan_on) || id(green_fan_breeze) || want_spd != (int) id(green_fan_speed)) {
+            id(tx_send).execute(2, ${green_id_dec}, ${green_k}, SPD_CMD[want_spd], ${green_freq_mhz});
+            id(green_fan_on) = true;
+            id(green_fan_breeze) = false;
+            id(green_fan_speed) = want_spd;
+          }
+          if (want_fwd != id(green_fan_fwd)) {
+            id(tx_send).execute(2, ${green_id_dec}, ${green_k}, want_fwd ? 0x04 : 0x11, ${green_freq_mhz});
+            id(green_fan_fwd) = want_fwd;
+          }
+
 # -----------------------------------------------------------------------------
 # LIGHTS — binary light over a template output implementing toggle-on-
 # difference: the RF Light command (0x08) is a pure toggle, so we transmit
@@ -528,6 +619,15 @@ output:
           if (state == id(guest_light_on)) return;
           id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, 0x08, ${guest_freq_mhz});
           id(guest_light_on) = state;
+  - platform: template
+    id: green_light_out
+    type: binary
+    write_action:
+      - lambda: |-
+          if (id(suppress_tx)) return;
+          if (state == id(green_light_on)) return;
+          id(tx_send).execute(2, ${green_id_dec}, ${green_k}, 0x08, ${green_freq_mhz});
+          id(green_light_on) = state;
 
 light:
   # ---- STATUS-LED (3/5, optional) — the onboard WS2812, internal (not a
@@ -557,6 +657,11 @@ light:
     id: guest_light
     name: "Guest Light"
     output: guest_light_out
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: binary
+    id: green_light
+    name: "Green Light"
+    output: green_light_out
     restore_mode: RESTORE_DEFAULT_OFF
 
 # ---- STATUS-LED (4/5, optional) — the painter. Priority order: component
@@ -744,6 +849,71 @@ button:
           else                    id(guest_light).turn_off().perform();
           id(suppress_tx) = false;
 
+  # ============================ GREEN (unit 2) =============================
+  - platform: template
+    name: "Green Timer 1h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 2
+          id_: ${green_id_dec}
+          k: ${green_k}
+          cmd: 2
+          freq: ${green_freq_mhz}
+  - platform: template
+    name: "Green Timer 2h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 2
+          id_: ${green_id_dec}
+          k: ${green_k}
+          cmd: 9
+          freq: ${green_freq_mhz}
+  - platform: template
+    name: "Green Timer 4h"
+    icon: mdi:timer
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 2
+          id_: ${green_id_dec}
+          k: ${green_k}
+          cmd: 25
+          freq: ${green_freq_mhz}
+  - platform: template
+    name: "Green All Off"
+    icon: mdi:power-off
+    on_press:
+      - script.execute:
+          id: tx_send
+          unit: 2
+          id_: ${green_id_dec}
+          k: ${green_k}
+          cmd: 6
+          freq: ${green_freq_mhz}
+      - lambda: |-
+          id(suppress_tx) = true;
+          id(green_fan_on) = false;
+          id(green_fan_breeze) = false;
+          id(green_light_on) = false;
+          id(green_fan).turn_off().perform();
+          id(green_light).turn_off().perform();
+          id(suppress_tx) = false;
+  - platform: template
+    name: "Green Light State Invert"
+    icon: mdi:lightbulb-question
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          id(suppress_tx) = true;
+          id(green_light_on) = !id(green_light_on);
+          if (id(green_light_on)) id(green_light).turn_on().perform();
+          else                   id(green_light).turn_off().perform();
+          id(suppress_tx) = false;
+
 # -----------------------------------------------------------------------------
 # RX — decode the physical remotes on GDO2/GPIO6 and mirror their presses
 # into the entities (suppressed sync: no re-transmit; the native API pushes
@@ -806,7 +976,8 @@ remote_receiver:
           const uint32_t r2 = f >> 12;
           const uint8_t  k2 = ((f >> 8) & 0xF) ^ ((f >> 4) & 0xF) ^ (f & 0xF);
           if ((r2 == (uint32_t) ${office_id_dec} && k2 == (${office_k} & 0xF)) ||
-              (r2 == (uint32_t) ${guest_id_dec}  && k2 == (${guest_k} & 0xF))) {
+              (r2 == (uint32_t) ${guest_id_dec}  && k2 == (${guest_k} & 0xF)) ||
+              (r2 == (uint32_t) ${green_id_dec}   && k2 == (${green_k} & 0xF))) {
             frame = f;
             valid = true;
           }
@@ -826,12 +997,15 @@ remote_receiver:
         // re-fire the action (double-flipping the assumed light state).
         int unit;
         if (valid) {
-          unit = (rid == (uint32_t) ${office_id_dec}) ? 0 : 1;
-        } else if (rid == (uint32_t) ${office_id_dec} || rid == (uint32_t) ${guest_id_dec}) {
+          unit = (rid == (uint32_t) ${office_id_dec}) ? 0
+               : (rid == (uint32_t) ${guest_id_dec})  ? 1 : 2;
+        } else if (rid == (uint32_t) ${office_id_dec} || rid == (uint32_t) ${guest_id_dec} ||
+                   rid == (uint32_t) ${green_id_dec}) {
           // Shape-valid but K wrong and no validated window in the chunk:
           // a misdecoded repeat. Log and ignore; no state, no dedup.
           ESP_LOGW("rx_b99", "%s ID but K=0x%X — misdecode, ignored (frame=0x%08X)",
-                   rid == (uint32_t) ${office_id_dec} ? "office" : "guest",
+                   rid == (uint32_t) ${office_id_dec} ? "office"
+                 : rid == (uint32_t) ${guest_id_dec}  ? "guest" : "green",
                    K, (unsigned) frame);
           return;
         } else {
@@ -867,19 +1041,21 @@ remote_receiver:
 
         // ---- Per-unit handles (globals are references; entities are the
         // same template types for both fans).
-        bool    &g_on     = (unit == 0) ? id(office_fan_on)     : id(guest_fan_on);
-        uint8_t &g_speed  = (unit == 0) ? id(office_fan_speed)  : id(guest_fan_speed);
-        bool    &g_fwd    = (unit == 0) ? id(office_fan_fwd)    : id(guest_fan_fwd);
-        bool    &g_breeze = (unit == 0) ? id(office_fan_breeze) : id(guest_fan_breeze);
-        bool    &g_light  = (unit == 0) ? id(office_light_on)   : id(guest_light_on);
-        uint8_t &g_ctr    = (unit == 0) ? id(ctr_office)        : id(ctr_guest);
-        fan::Fan *f = (unit == 0) ? (fan::Fan *) id(office_fan) : (fan::Fan *) id(guest_fan);
-        auto *lt = (unit == 0) ? id(office_light) : id(guest_light);
-        const char *who = (unit == 0) ? "office" : "guest";
+        bool    &g_on     = (unit == 0) ? id(office_fan_on)     : (unit == 1) ? id(guest_fan_on)     : id(green_fan_on);
+        uint8_t &g_speed  = (unit == 0) ? id(office_fan_speed)  : (unit == 1) ? id(guest_fan_speed)  : id(green_fan_speed);
+        bool    &g_fwd    = (unit == 0) ? id(office_fan_fwd)    : (unit == 1) ? id(guest_fan_fwd)    : id(green_fan_fwd);
+        bool    &g_breeze = (unit == 0) ? id(office_fan_breeze) : (unit == 1) ? id(guest_fan_breeze) : id(green_fan_breeze);
+        bool    &g_light  = (unit == 0) ? id(office_light_on)   : (unit == 1) ? id(guest_light_on)   : id(green_light_on);
+        uint8_t &g_ctr    = (unit == 0) ? id(ctr_office)        : (unit == 1) ? id(ctr_guest)        : id(ctr_green);
+        fan::Fan *f = (unit == 0) ? (fan::Fan *) id(office_fan)
+                    : (unit == 1) ? (fan::Fan *) id(guest_fan)
+                                  : (fan::Fan *) id(green_fan);
+        auto *lt = (unit == 0) ? id(office_light) : (unit == 1) ? id(guest_light) : id(green_light);
+        const char *who = (unit == 0) ? "office" : (unit == 1) ? "guest" : "green";
         // TX parameters for this unit (used by the deferred-direction settle).
-        const int   u_id   = (unit == 0) ? ${office_id_dec} : ${guest_id_dec};
-        const int   u_k    = (unit == 0) ? ${office_k} : ${guest_k};
-        const float u_freq = (unit == 0) ? ${office_freq_mhz} : ${guest_freq_mhz};
+        const int   u_id   = (unit == 0) ? ${office_id_dec}   : (unit == 1) ? ${guest_id_dec}   : ${green_id_dec};
+        const int   u_k    = (unit == 0) ? ${office_k}        : (unit == 1) ? ${guest_k}        : ${green_k};
+        const float u_freq = (unit == 0) ? ${office_freq_mhz} : (unit == 1) ? ${guest_freq_mhz} : ${green_freq_mhz};
 
         // Resync our TX counter to follow the remote's sequence.
         g_ctr = (cnt + 1) & 0x7;
