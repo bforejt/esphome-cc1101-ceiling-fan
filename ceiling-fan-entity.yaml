@@ -42,11 +42,14 @@
 #      to off — it IS the manual resync-to-known-state affordance.
 #    - Fan power cycle desyncs everything until the next command. Unavoidable
 #      without RX; RX (roadmap) heals fan state on the next remote press.
-#    - Direction set while the fan is OFF is NOT transmitted; it displays
-#      immediately and is applied on the next turn-on as [Speed N, then
-#      F/R], queued ~450ms apart. Deliberate: ANY command — F/R included —
-#      starts a stopped fan (verified), so transmitting the direction change
-#      immediately would surprise-start it.
+#    - Direction is ASSERTED on every turn-on as [Speed N, then F/R], ~450ms
+#      apart: the fan does not reliably preserve direction across a restart
+#      (some units power up forward regardless of last direction), so we set
+#      it explicitly instead of trusting fan memory — exactly as we already
+#      send Speed N rather than trusting remembered speed. A direction change
+#      made while the fan is OFF is still not transmitted immediately (that
+#      would surprise-start the fan — any command starts a stopped fan); it
+#      displays at once and is applied on the next turn-on.
 #
 #  PROVENANCE: protocol, timings, wiring, and the four hard-won fixes are
 #  documented in ceiling-fan-radio.yaml and the README. The tx_send frame
@@ -470,6 +473,7 @@ fan:
           const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
           int want_spd = f->speed;
           if (want_spd < 1 || want_spd > 6) want_spd = id(office_fan_speed);  // turn-on w/o pct -> last speed
+          const bool was_off = !id(office_fan_on);   // capture before step 3 flips it
           static const uint8_t SPD_CMD[7] = {0, 0x10, 0x12, 0x1C, 0x0A, 0x0F, 0x0C};
 
           // 1) OFF (direction flips while off are NOT transmitted — deferred
@@ -497,10 +501,14 @@ fan:
             id(office_fan_breeze) = false;
             id(office_fan_speed) = want_spd;
           }
-          // 4) Direction — F/R preserves speed (validated); only TX while on.
-          //    Runs after 3, so a deferred off-state flip settles as
-          //    [Speed N, then F/R], serialized by the queued tx_send.
-          if (want_fwd != id(office_fan_fwd)) {
+          // 4) Direction — F/R preserves speed (validated), F/R absolute so a
+          //    redundant assert is harmless. Sent on any change while running,
+          //    AND on every turn-on (was_off): the fan may power up forward
+          //    regardless of last direction, so assert rather than trust its
+          //    memory. Runs after 3 -> turn-on settles as [Speed N, then F/R].
+          //    (Breeze turn-on excluded: direction in natural-wind mode is
+          //    unverified.)
+          if (want_fwd != id(office_fan_fwd) || (was_off && !want_brz)) {
             id(tx_send).execute(0, ${office_id_dec}, ${office_k}, want_fwd ? 0x04 : 0x11, ${office_freq_mhz});
             id(office_fan_fwd) = want_fwd;
           }
@@ -522,6 +530,7 @@ fan:
           const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
           int want_spd = f->speed;
           if (want_spd < 1 || want_spd > 6) want_spd = id(guest_fan_speed);
+          const bool was_off = !id(guest_fan_on);   // capture before step 3 flips it
           static const uint8_t SPD_CMD[7] = {0, 0x10, 0x12, 0x1C, 0x0A, 0x0F, 0x0C};
 
           if (!want_on) {
@@ -545,7 +554,9 @@ fan:
             id(guest_fan_breeze) = false;
             id(guest_fan_speed) = want_spd;
           }
-          if (want_fwd != id(guest_fan_fwd)) {
+          // Direction — assert on any change while running AND on every
+          // turn-on (was_off); see the office fan for rationale.
+          if (want_fwd != id(guest_fan_fwd) || (was_off && !want_brz)) {
             id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, want_fwd ? 0x04 : 0x11, ${guest_freq_mhz});
             id(guest_fan_fwd) = want_fwd;
           }
@@ -567,6 +578,7 @@ fan:
           const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
           int want_spd = f->speed;
           if (want_spd < 1 || want_spd > 6) want_spd = id(green_fan_speed);
+          const bool was_off = !id(green_fan_on);   // capture before step 3 flips it
           static const uint8_t SPD_CMD[7] = {0, 0x10, 0x12, 0x1C, 0x0A, 0x0F, 0x0C};
 
           if (!want_on) {
@@ -590,7 +602,9 @@ fan:
             id(green_fan_breeze) = false;
             id(green_fan_speed) = want_spd;
           }
-          if (want_fwd != id(green_fan_fwd)) {
+          // Direction — assert on any change while running AND on every
+          // turn-on (was_off); see the office fan for rationale.
+          if (want_fwd != id(green_fan_fwd) || (was_off && !want_brz)) {
             id(tx_send).execute(2, ${green_id_dec}, ${green_k}, want_fwd ? 0x04 : 0x11, ${green_freq_mhz});
             id(green_fan_fwd) = want_fwd;
           }
