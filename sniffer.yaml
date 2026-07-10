@@ -38,7 +38,10 @@
 #  STATUS LED (onboard WS2812, or any NeoPixel on a free GPIO):
 #      red     a component is in error state
 #      amber   the radio is not online
-#      white   flashes on every capture
+#      white   flashes on a decoded packet (in Raw Pulses mode: on every
+#              capture, because there every capture is the signal). NOT on
+#              noise chunks — a wide-open OOK receiver sees those constantly
+#              and the LED would sit solid white.
 #      green   booted and healthy
 #    "Radio not online" is a real probe, not a guess: RadioLib's VERSION
 #    register answers 0x14 (or legacy 0x04) only when a CC1101 is connected
@@ -417,13 +420,19 @@ interval:
           else                                                     s = 3;  // green
           if (s == last_state) return;
           last_state = s;
-          float r = 0, g = 0, b = 0, br = 0.35f;
+          // Brightness is per-channel, so a 3-channel white looks far brighter
+          // than a 1-channel green at the same value. These are balanced by
+          // eye, not by number: white is the flash, green is a calm idle.
+          float r = 0, g = 0, b = 0, br = 0.45f;
           switch (s) {
             case 0: r = 1;                              break;  // red   : error
             case 1: r = 1; g = 0.45f;                   break;  // amber : radio offline
-            case 2: r = 1; g = 1; b = 1;  br = 0.60f;   break;  // white : receiving
-            case 3: g = 1;                br = 0.10f;   break;  // green : healthy
+            case 2: r = 1; g = 1; b = 1;  br = 0.50f;   break;  // white : packet
+            case 3: g = 1;                br = 0.25f;   break;  // green : healthy
           }
+          static const char *const NAMES[] = {"red/error", "amber/radio-offline",
+                                              "white/packet", "green/healthy"};
+          ESP_LOGD("sniffer", "led -> %s", NAMES[s]);
           auto call = id(status_rgb).turn_on();
           call.set_transition_length(0);
           call.set_rgb(r, g, b);
@@ -444,12 +453,15 @@ remote_receiver:
   on_raw:
     - lambda: |-
         id(chunks_seen)++;
-        id(last_rx_ms) = millis();
-        id(rx_flash_ms) = millis();   // white LED flash on every capture
+        id(last_rx_ms) = millis();   // any RF activity feeds the watchdog
 
         // ---------------- RAW MODE: print the pulse list -----------------
         // Marks positive us, spaces negative. Chunked into readable lines.
         if (id(log_mode).current_option() == "Raw Pulses") {   // .state is deprecated
+          // In raw mode every capture IS the signal you are watching, so the
+          // LED flashes on each chunk. (In decode mode it flashes only on a
+          // real packet — noise chunks are not packets.)
+          id(rx_flash_ms) = millis();
           ESP_LOGI("raw", "---- chunk: %u edges ----", (unsigned) x.size());
           char buf[160];
           int pos = 0, count = 0;
@@ -490,6 +502,7 @@ remote_receiver:
         }
         if (!found) return;                    // noise chunk — silently dropped
         id(frames_decoded)++;
+        id(rx_flash_ms) = millis();            // white flash: a real packet arrived
 
         const uint32_t rid  = frame >> 12;          // 20-bit remote ID
         const uint8_t  cmd  = (frame >> 7) & 0x1F;  // 5-bit command

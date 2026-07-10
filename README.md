@@ -567,8 +567,11 @@ NeoPixel on a free GPIO via `pin_status_led`):
 |---|---|
 | red | a component is in error state |
 | amber | the radio is not online |
-| white flash | a capture arrived |
+| white flash | a **decoded packet** arrived (in `Raw Pulses` mode: any capture) |
 | green | booted and healthy |
+
+The flash deliberately ignores noise chunks — a wide-open OOK receiver sees
+those constantly, and the LED would sit solid white.
 
 "Radio not online" is a real probe, not a guess: RadioLib's `VERSION` register
 answers `0x14` only when a CC1101 is connected and responding, and the
