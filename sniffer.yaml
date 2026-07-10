@@ -1,5 +1,5 @@
 # #############################################################################
-# ##  433MHz RF SNIFFER — ESP32 + CC1101 (RadioLib)                          ##
+# ##  RADIO SNIFFER — ESP32 + CC1101 (RadioLib)                              ##
 # ##  Receive-only capture / decode bench with a web management UI           ##
 # #############################################################################
 #
@@ -81,7 +81,7 @@
 
 substitutions:
   device_name: sniffer
-  friendly_name: "433 Sniffer"
+  friendly_name: "Radio Sniffer"
   pin_rx: "6"                  # GDO2 (bridges' RX wire). "5" = GDO0 (native).
 
   # ---- STATUS LED (optional). Onboard WS2812 on the ESP32-S3-DevKitM-1 is
