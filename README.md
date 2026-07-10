@@ -30,8 +30,8 @@ any of it does so entirely at their own risk**. Parts of the overall system
 
 | Variant | File | What HA sees | State |
 |---------|------|--------------|-------|
-| **Stateless** (reference) | `ceiling-fan-radio.yaml` | 15 buttons per fan, 1:1 with RF commands | None on device — model state in HA if you want it |
-| **Stateful** (flagship) | `ceiling-fan-entity.yaml` | A native **fan entity** (on/off, 6 speeds, direction, "Breeze" preset) + a **light entity** + timer/All-Off buttons per fan | Assumed state on the device, restored from flash across reboots — and **updated by listening to the physical remotes** (clean RF signal required; see below) |
+| **Stateless** (reference) | `ceiling-fans-stateless.yaml` | 15 buttons per fan, 1:1 with RF commands | None on device — model state in HA if you want it |
+| **Stateful** (flagship) | `ceiling-fans-stateful.yaml` | A native **fan entity** (on/off, 6 speeds, direction, "Breeze" preset) + a **light entity** + timer/All-Off buttons per fan | Assumed state on the device, restored from flash across reboots — and **updated by listening to the physical remotes** (clean RF signal required; see below) |
 
 Both share the same hardware, wiring, protocol values, and bench-proven transmit
 engine. **Flash one variant per board** — switching variants creates a new device
@@ -110,11 +110,10 @@ GND    ───────►   GND
 GDO2   ───────►   GPIO6     (receive data; needed only by the stateful variant's RX)
 ```
 
-Receive — both the **stateful variant's built-in RX** and the
-`ceiling-fan-listener.yaml` capture tool — listens on **GDO2 → GPIO6** (the
-firmware routes RX data to GDO2 at boot; GDO0 is owned by transmit in the
-bridges). Boards without the GDO2 wire can run the listener on same-pin GDO0
-instead by setting its `pin_rx: "5"` (see
+Receive — both the **stateful variant's built-in RX** and the `sniffer.yaml`
+capture tool — listens on **GDO2 → GPIO6** (the firmware routes RX data to
+GDO2 at boot; GDO0 is owned by transmit in the bridges). The sniffer never
+transmits, so it can equally read GDO0 by setting its `pin_rx: "5"` (see
 [Capturing](#capturing--decoding-your-remote)). If you only run the stateless
 variant, leave GDO2 unconnected.
 
@@ -136,9 +135,9 @@ variant, leave GDO2 unconnected.
 
 | File | Role |
 |------|------|
-| `ceiling-fan-radio.yaml` | The **stateless** variant: two fans (Office, Guest) as repeated button blocks sharing one transmit engine. The minimal reference — also the protocol-provenance record. |
-| `ceiling-fan-entity.yaml` | The **stateful** variant: native fan + light entities per fan, on-device assumed state, same transmit engine. See [The stateful variant](#the-stateful-variant). |
-| `ceiling-fan-listener.yaml` | **Capture tool**, not a bridge: receive-only config with a raw-vs-decode output toggle and runtime-tunable listen frequency. Decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. Flash temporarily to extract your remote's values. See [Plan A](#plan-a--let-the-firmware-decode-for-you-recommended). |
+| `ceiling-fans-stateless.yaml` | The **stateless** variant: two fans (Office, Guest) as repeated button blocks sharing one transmit engine. The minimal reference — also the protocol-provenance record. |
+| `ceiling-fans-stateful.yaml` | The **stateful** variant: native fan + light entities per fan, on-device assumed state, same transmit engine. See [The stateful variant](#the-stateful-variant). |
+| `sniffer.yaml` | **Capture tool / RF bench**, not a bridge: receive-only, with a **web UI** for tuning the radio (frequency, bitrate, bandwidth), switching the log between B99 decode and raw pulses, restarting the radio, and reading RSSI + capture counters. Decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. See [Plan A](#plan-a--let-the-firmware-decode-for-you-recommended). |
 
 > Both configs are intentionally **single readable flat files** with some
 > repetition between fans, rather than clever multi-file packages. See
@@ -222,7 +221,7 @@ the UX.
 
 ## The stateful variant
 
-`ceiling-fan-entity.yaml` turns each fan into a native ESPHome **fan entity**
+`ceiling-fans-stateful.yaml` turns each fan into a native ESPHome **fan entity**
 (on/off, 6-step speed slider, forward/reverse, a "Breeze" preset for the
 Variable command) plus a **light entity**, with **assumed state** kept in
 flash-restored globals on the device. Native entities mean the standard HA fan
@@ -289,12 +288,12 @@ The **goal** is to keep all three parties — the fan controller, the physical
 remote, and this ESP — in sync where possible. Please note the limits:
 
 - **The RF signal must be clean for reliable decode.** The fan's purpose-built
-  receiver is far more forgiving than our general-purpose CC1101: one of our
-  two remotes decodes perfectly, while the other operates its fan reliably yet
-  arrives too noisy for us to decode consistently. (Register-tuning
-  experiments — RX data rate, DN022 AGC — both made things worse and were
-  reverted; the git history documents them. Carrier-offset measurement via
-  SDR is the open diagnostic lead.)
+  receiver is far more forgiving than our general-purpose CC1101: most of our
+  remotes decode perfectly, while one operates its fan reliably yet arrives
+  too noisy for us to decode consistently. (Register-tuning experiments — RX
+  data rate, DN022 AGC — both made things worse and were reverted; the git
+  history documents them. Carrier-offset measurement via SDR is the open
+  diagnostic lead.)
 - **The protocol is one-way.** The fan controller never acknowledges anything,
   so there is no confirmation that a command — ours or the remote's — was
   actually acted on. Sync drift cannot be *prevented*, only reduced and
@@ -521,11 +520,10 @@ protocol documentation of any kind). An **over-the-air capture of your remote
 is required no matter what** — the only question is who does the decoding:
 the firmware (Plan A) or you with help (Plan B).
 
-The `ceiling-fan-listener.yaml` tool exists to make Plan A as easy as
-possible, and to be this project's bench instrument — raw pulse dumps,
-runtime frequency tuning, and room for more capture/test knobs over time.
-Please note the listener is a **work in progress**: receive reliability is
-still being hardened across radio-module variants. The stateful entity
+The `sniffer.yaml` tool exists to make Plan A as easy as possible, and to be
+this project's bench instrument — a web UI for radio tuning, raw pulse dumps,
+B99 decoding, and capture statistics. It is built on the same receive chain
+the stateful variant decodes three fans with in production. The stateful
 variant carries the same decoder, so it works as a discovery tool too.
 
 ### Plan A — let the firmware decode for you (recommended)
@@ -536,37 +534,45 @@ Either config decodes B99 frames off the air and hands you the values:
   logs a `rx_discover` line with the decoded `id`, `cmd`, `cnt`, and solved
   `K` — you can onboard a new remote without leaving the production
   firmware.
-- **The listener** (details below): the dedicated tool, with raw dumps and
-  frequency tuning for the harder cases.
+- **The sniffer** (`sniffer.yaml`, details below): the dedicated receive-only
+  tool and RF bench, with a web UI, raw dumps, and radio tuning for the
+  harder cases.
 
-The repo ships `ceiling-fan-listener.yaml`: a receive-only config using the
-same **proven receive chain** as the stateful variant (RX data on
-GDO2 → GPIO6, DRATE 100, stock AGC — please note: bitrate 10 and DN022 AGC
-values were each bench-proven deaf on this hardware, so the listener
-deliberately matches the working combination). Boards without the GDO2 wire
-can set `pin_rx: "5"` to fall back to same-pin GDO0 receive.
+#### The sniffer
 
-Two runtime controls, usable from the ESP's own web page or HA:
+`sniffer.yaml` is receive-only and reuses the **exact receive chain the
+stateful variant decodes three fans with in production** — RadioLib, bitrate
+100, stock AGC, RX on GDO2 → GPIO6. It never transmits, so it can also read
+GDO0 by setting `pin_rx: "5"`.
 
-- **Raw Dump Mode** switch (either/or): **off** = decode mode, **on** = raw
-  pulse lists for hand-decoding unknown protocols.
-- **Listen Frequency** + **Apply Frequency**: type a frequency in MHz, press
-  Apply — the radio re-tunes and restarts receive there (persists across
-  reboots). Useful for hunting an off-center remote; cheap SAW-resonator
-  transmitters can sit 100+ kHz off 433.92.
+Everything is managed from the device's own **web page** (and mirrored into
+Home Assistant if you connect it):
+
+| Control | Purpose |
+|---|---|
+| **Log Mode** | `B99 Decode` (default) or `Raw Pulses` |
+| **Frequency** | MHz, 5 kHz steps — hunt an off-center remote (cheap SAW transmitters sit 100+ kHz off) |
+| **Bitrate** | the CC1101 DRATE register (not the OOK symbol rate). **100 is the proven value**; 10 went completely deaf on known-good hardware |
+| **Bandwidth** | RX filter in kHz, snapped to the chip's legal steps. Widen for capture margin |
+| **RX Watchdog** | minutes without a capture before the radio auto-restarts; `0` = off |
+| **Apply Radio Settings** / **Restart Radio** / **Reset Statistics** | re-tune + re-enter RX, full re-init, zero the counters |
+
+Readouts: **RSSI**, **Chunks Captured**, **Frames Decoded**, **Presses**, and
+**Last Frame** (the decoded `id` / `K` / command).
 
 To extract a remote's values:
 
-1. Flash `ceiling-fan-listener.yaml` (temporarily — reflash your bridge
-   variant afterwards), leave Raw Dump Mode off, and stream logs.
+1. Flash `sniffer.yaml`, open its web page, leave **Log Mode** on `B99 Decode`.
 2. Press a remote button near the antenna. Each press produces ~10 decoded
-   lines (one per RF repeat) tagged `b99_decode`:
+   lines (one per RF repeat), tagged `b99`, and the first is marked
+   `<-- press`:
    ```
-   frame=0x003B940F id=0x003B9 (953) cmd=0x08 cnt=0 csum=0xF -> K=0xB (11)
+   frame=0x003B940F id=0x003B9 (953) cmd=0x08 (Light) cnt=0 csum=0xF -> K=0xB (11) rssi=-42dBm  <-- press
    ```
-   Identical repeats are your confidence signal. An `rssi` line spiking from
-   the idle floor (−90s dBm) confirms the radio hears the transmission even
-   when nothing decodes.
+   Identical repeats are your confidence signal. **Presses** counts
+   deduplicated presses; **Last Frame** shows the decode. RSSI spiking off the
+   idle floor (−90s dBm) proves the radio hears the transmission even when
+   nothing decodes.
 3. Press several **different** buttons: `K` must come out the same every time
    (it's a per-remote constant — see [Finding K](#finding-k)); `cnt` should
    increment by one per press, mod 8.
@@ -576,6 +582,13 @@ If decode lines are inconsistent or absent — a weak, off-frequency, or
 non-B99 remote (the fan's purpose-built receiver is far more forgiving than
 our CC1101) — move to Plan B.
 
+> **Before you touch a single register:** a faulty CC1101 module cost this
+> project days of chasing bitrate and AGC theories that were all void — a
+> replacement module simply worked. Check that the antenna is actually
+> soldered to the module, then suspect the module itself. RF debugging order
+> is **antenna → module → modulation → framing → timing**; register tuning is
+> the last resort, not the first.
+
 ### Plan B — raw captures + an LLM (noisy remotes, unknown protocols)
 
 When the firmware can't decode cleanly, collect **raw pulse captures** and
@@ -584,8 +597,8 @@ this project's own remotes arrives too noisy for the on-device decoder, yet
 enough raw captures gave an LLM the redundancy to align the frames and
 recover the ID and `K` correctly.
 
-1. **Capture raw.** Flip the listener's **Raw Dump Mode** on (or use a
-   custom sniffer variant, or an SDR — below) and record **many presses of
+1. **Capture raw.** Set the sniffer's **Log Mode** to `Raw Pulses` (or use an
+   SDR — below) and record **many presses of
    known buttons in a noted order** — e.g., Light ×3, Speed 1 ×3, Speed 2 ×3.
    Each press yields ~10 repeats; redundancy is what makes noisy data
    solvable. Sporadic noise chunks with no transmission are normal for a
@@ -609,7 +622,7 @@ cleanest 32-mark frames among the repeats.
 
 > **Gotcha we hit (documented so you don't):** the receiver's `idle` must be
 > *shorter* than the ≈7750 µs inter-frame sync gap but *longer* than the
-> longest within-frame space (≈750 µs) — the listener ships 5500 µs. If
+> longest within-frame space (≈750 µs) — the sniffer ships 5500 µs. If
 > `idle` exceeds the sync gap, every repeat concatenates into one oversized
 > capture that overflows the buffer: you'll see a flood of `Buffer overflow`
 > and **zero** decoded frames. That flood means the radio *is hearing the
@@ -729,6 +742,12 @@ to be in RF range of our house, please don't.
 - Turning RX registers blindly breaks reception: DRATE 10 (with stock AGC) and
   DN022 AGC values (with DRATE 100) each went completely deaf — both reverted;
   the shipped SmartRC-AGC + DRATE-100 combination is a narrow working point.
+- **Suspect the hardware before the registers.** A second CC1101 module was
+  simply faulty: it passed its SPI chip-ID check, reported RSSI, and emitted
+  demodulator noise on its GDO pins, yet never decoded a real transmission on
+  any pin, driver, frequency, or register combination. Days of firmware
+  theories died the moment the module was swapped. A healthy-looking SPI
+  handshake proves the digital bus, not the radio.
 
 **Inferred (consistent with evidence, not directly confirmed):**
 - That the encoder is specifically EV1527/PT2262 (identified by *behavior*, not by
