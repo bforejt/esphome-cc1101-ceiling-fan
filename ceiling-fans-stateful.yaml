@@ -3,7 +3,7 @@
 # ##  STATEFUL "fan entity" variant — on-device assumed state               ##
 # #############################################################################
 #
-#  The stateful counterpart to ceiling-fan-radio.yaml (the stateless button
+#  The stateful counterpart to ceiling-fans-stateless.yaml (the stateless button
 #  bridge). Same hardware, same bench-proven RF engine — but each fan is a
 #  native ESPHome FAN entity (on/off, 6 speeds, direction, "Breeze" preset)
 #  plus a LIGHT entity, with assumed state retained on the device and restored
@@ -52,7 +52,7 @@
 #      displays at once and is applied on the next turn-on.
 #
 #  PROVENANCE: protocol, timings, wiring, and the four hard-won fixes are
-#  documented in ceiling-fan-radio.yaml and the README. The tx_send frame
+#  documented in ceiling-fans-stateless.yaml and the README. The tx_send frame
 #  builder below is copied VERBATIM from the bench-proven original; only its
 #  script mode (queued) and a pacing delay are new.
 #

@@ -13,3 +13,7 @@ __pycache__/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Diagnostic log dumps copied in for analysis
+logs*.txt
+*.log

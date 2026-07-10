@@ -1,0 +1,555 @@
+# #############################################################################
+# ##  RADIO SNIFFER — ESP32 + CC1101 (RadioLib)                              ##
+# ##  Receive-only capture / decode bench with a web management UI           ##
+# #############################################################################
+#
+#  A receive-only companion to the two bridges. Use it to pull a remote's
+#  20-bit ID and checksum key K off the air, to characterize an unknown
+#  remote, or as a general 433 MHz test bench. It never transmits.
+#
+#  BUILT ON THE PROVEN RX CHAIN. This is a deliberate reset: it reuses the
+#  exact receive configuration that ceiling-fans-stateful.yaml has been
+#  decoding three fans with in production — RadioLib component, bitrate 100,
+#  stock SmartRC AGC, RX data on GDO2 -> GPIO6 (IOCFG2 asserted at boot),
+#  remote_receiver idle 5500us. An earlier listener chased register settings
+#  against a FAULTY CC1101 module; replacing the module fixed reception, and
+#  those findings are void. Do not repeat them (see AGC note below).
+#
+#  ---------------------------------------------------------------------------
+#  WEB UI (http://<device>/ — also exposed to Home Assistant if you use it):
+#    Controls
+#      Log Mode         select: "B99 Decode" (default) or "Raw Pulses"
+#      Frequency        MHz, 5 kHz steps
+#      Bitrate          kBd — the CC1101 DRATE register. NOT the OOK symbol
+#                       rate; in async mode it sets the RX data-filter width.
+#                       100 is the PROVEN value. 10 went completely deaf on
+#                       known-good hardware. Change only to experiment.
+#      Bandwidth        kHz RX filter. Snapped by the driver to one of
+#                       58/68/81/102/116/135/162/203/232/270/325/406/464/
+#                       541/650/812. Widen to catch an off-frequency remote.
+#      RX Watchdog      minutes with no captures before the radio auto-
+#                       restarts. 0 = disabled (default). For unattended rigs.
+#      Apply Radio Settings   re-tunes and re-enters RX with the values above
+#      Restart Radio          full re-init (standby -> registers -> RX)
+#      Reset Statistics       zero the counters
+#    Readouts
+#      RSSI, Chunks Captured, Frames Decoded, Presses, Last Frame
+#
+#  STATUS LED (onboard WS2812, or any NeoPixel on a free GPIO):
+#      red     a component is in error state
+#      amber   the radio is not online
+#      white   flashes on a decoded packet (in Raw Pulses mode: on every
+#              capture, because there every capture is the signal). NOT on
+#              noise chunks — a wide-open OOK receiver sees those constantly
+#              and the LED would sit solid white.
+#      green   booted and healthy
+#    "Radio not online" is a real probe, not a guess: RadioLib's VERSION
+#    register answers 0x14 (or legacy 0x04) only when a CC1101 is connected
+#    and responding, and the driver's init_state must be clean with the radio
+#    parked in receive. The component never calls mark_failed(), so without
+#    this probe a missing radio would go completely unreported.
+#    PLEASE NOTE the honest limit: this catches a radio that is ABSENT,
+#    miswired, or failed to init. It CANNOT catch a chip that answers SPI
+#    perfectly yet is deaf on the air — this project owned exactly such a
+#    module, and it cost days. Green means "the radio is talking to us", not
+#    "the radio can hear".
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO PULL A REMOTE'S ID / K
+#    1. Flash, open the web page, leave Log Mode on "B99 Decode".
+#    2. Press a remote button near the antenna. One press = ~10 RF repeats =
+#       ~10 identical log lines; identical repeats are your confidence signal.
+#       "Presses" counts deduplicated presses, "Last Frame" shows the decode.
+#    3. Press several DIFFERENT buttons. K must be the SAME every time (it is
+#       a per-remote constant); the counter increments by one per press,
+#       mod 8. If K wanders, your bit alignment is off.
+#    4. Copy the decimal id and K into a bridge config's substitutions.
+#    Not a B99 remote (K inconsistent / nothing decodes)? Switch Log Mode to
+#    "Raw Pulses" and decode by hand, or feed the dumps to an LLM along with
+#    the README's protocol section. Sporadic noise chunks with no
+#    transmission are normal for a wide-open OOK receiver.
+#
+#  WIRING (ESP32-S3-DevKitM-1 <-> CC1101 E07-M1101D):
+#    GDO2 -> GPIO6   (receive data; this file asserts IOCFG2 at boot)
+#    CSN->GPIO10  SCK->GPIO12  MOSI->GPIO11  MISO->GPIO13
+#    VCC->3V3 (NOT 5V)  GND->GND.   GDO0 unused (we never transmit).
+#    Alternative: set pin_rx to "5" to read GDO0 instead — RadioLib routes RX
+#    data there natively. Both work; GDO2 matches the bridges' wiring.
+#
+#  IF YOU HEAR NOTHING: check the antenna is actually soldered to the module
+#  (ours was not, and a second module was simply dead). RF debugging order is
+#  antenna -> module -> modulation -> framing -> timing. Register tuning is
+#  the LAST resort, not the first.
+# #############################################################################
+
+substitutions:
+  device_name: sniffer
+  friendly_name: "Radio Sniffer"
+  pin_rx: "6"                  # GDO2 (bridges' RX wire). "5" = GDO0 (native).
+
+  # ---- STATUS LED (optional). Onboard WS2812 on the ESP32-S3-DevKitM-1 is
+  # ---- GPIO48 (some DevKitC-1 v1.0 boards use GPIO38). An external NeoPixel
+  # ---- on any free output-capable GPIO works identically. A WS2812 cannot be
+  # ---- probed at runtime, but driving a pin with no LED attached is harmless,
+  # ---- so this is safe to leave enabled on boards without one.
+  pin_status_led: "48"
+
+  # ---- First-boot RF defaults. All three are runtime-tunable from the web
+  # ---- page; the numbers restore from flash and are re-applied at boot.
+  def_freq_mhz: "433.92"       # B99 family carrier
+  def_bitrate_kbd: "100"       # PROVEN. 10 = deaf on known-good hardware.
+  def_bandwidth_khz: "464"     # wide, for capture margin
+
+  # ---- remote_receiver framing. idle MUST be shorter than the ~7750us
+  # ---- inter-frame sync gap but longer than the longest within-frame space
+  # ---- (~750us), or all 10 repeats merge into one oversized capture and the
+  # ---- buffer overflows (a "Buffer overflow" flood means the radio IS
+  # ---- hearing the remote — it is a frame-delimiting problem).
+  rx_idle: "5500us"
+  rx_glitch: "120us"           # reject sub-bit noise glitches
+
+  # ---- AGC — DO NOT CHANGE. These are the component's stock SmartRC values
+  # ---- and the only combination proven to receive on this hardware. TI
+  # ---- DN022's OOK values (0x04/0x00/0x92) made the receiver completely
+  # ---- deaf on a known-good module. Listed here because they are meaningful,
+  # ---- not because they are worth turning.
+  agc_ctrl2: "0xC7"
+  agc_ctrl1: "0x00"
+  agc_ctrl0: "0xB2"
+
+external_components:
+  # Same pinned commit as the bridges. Public API used below: _freq, _bitrate,
+  # _bandwidth, radio, setup_direct_mode(), standby(), recv(), getRSSI().
+  - source: github://juanboro/esphome-radiolib-cc1101@b79b8552d09682da561d8ff9b4b71ccea9b75f1b
+    components: [ radiolib_cc1101 ]
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // Apply the flash-restored radio settings, then hand the radio the
+          // one thing RadioLib will not do for us: route demodulated RX data
+          // to GDO2 as well as GDO0 (its async direct mode only sets IOCFG0).
+          id(radio_apply)->execute();
+          // current_option() — Select::state is deprecated, removed in 2026.7.0
+          ESP_LOGI("sniffer", "ready on GPIO%d — %s mode", ${pin_rx},
+                   id(log_mode).current_option().c_str());
+
+esp32:
+  board: esp32-s3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret esp_433_radio__encryption_key
+  reboot_timeout: 0s          # never reboot just because HA is absent
+
+ota:
+  - platform: esphome
+    on_begin:
+      - lambda: id(mycc1101).standby();
+    on_error:                 # a failed OTA keeps running — recover RX
+      - lambda: id(mycc1101).recv();
+
+web_server:
+  port: 80
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+spi:
+  clk_pin: GPIO12
+  mosi_pin: GPIO11
+  miso_pin: GPIO13
+
+# The component enters RX by itself at setup; the values below are the
+# first-boot defaults, overridden at on_boot by the restored web-UI numbers.
+radiolib_cc1101:
+  id: mycc1101
+  cs_pin: GPIO10
+  frequency: ${def_freq_mhz}MHz
+  modulation: OOK
+  filter: ${def_bandwidth_khz}kHz
+  bitrate: ${def_bitrate_kbd}
+  reg_agcctrl2: ${agc_ctrl2}
+  reg_agcctrl1: ${agc_ctrl1}
+  reg_agcctrl0: ${agc_ctrl0}
+
+globals:
+  - id: chunks_seen          # every capture the RMT receiver hands us
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: frames_decoded       # captures that yielded a valid 32-bit B99 frame
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: presses_seen         # deduplicated button presses (~10 repeats each)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: last_rx_ms           # last capture (millis) — feeds the RX watchdog
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: rx_flash_ms          # last capture (millis) — drives the white LED flash
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: radio_online         # refreshed by the probe below; drives the amber LED
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+
+# -----------------------------------------------------------------------------
+# RADIO CONTROL. setup_direct_mode() is the driver's own retune path: standby
+# -> write registers (freq/bitrate/bandwidth/AGC) -> setOOK -> recv(). It only
+# configures GDO0, so we re-assert IOCFG2 afterwards for the GDO2 wire.
+# -----------------------------------------------------------------------------
+script:
+  - id: radio_apply
+    mode: restart
+    then:
+      - lambda: |-
+          id(mycc1101)._freq      = id(cfg_freq).state;        // MHz
+          id(mycc1101)._bitrate   = id(cfg_bitrate).state;     // kBd (DRATE)
+          id(mycc1101)._bandwidth = id(cfg_bandwidth).state;   // kHz (snapped)
+          id(mycc1101).setup_direct_mode();
+          id(mycc1101).radio.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG2,
+                                            RADIOLIB_CC1101_GDOX_SERIAL_DATA_ASYNC, 5, 0);
+          id(last_rx_ms) = millis();   // don't let the watchdog fire on a fresh apply
+          ESP_LOGI("sniffer", "radio: %.3f MHz, %.1f kBd, %.0f kHz BW | IOCFG2=0x%02X",
+                   id(mycc1101)._freq, id(mycc1101)._bitrate, id(mycc1101)._bandwidth,
+                   (unsigned) id(mycc1101).radio.SPIgetRegValue(RADIOLIB_CC1101_REG_IOCFG2, 5, 0));
+
+select:
+  - platform: template
+    id: log_mode
+    name: "Log Mode"
+    icon: mdi:file-document-outline
+    optimistic: true
+    restore_value: true
+    initial_option: "B99 Decode"
+    options:
+      - "B99 Decode"
+      - "Raw Pulses"
+
+number:
+  - platform: template
+    id: cfg_freq
+    name: "Frequency"
+    icon: mdi:sine-wave
+    unit_of_measurement: "MHz"
+    mode: box
+    min_value: 387            # CC1101 mid band (it also does 300-348, 779-928)
+    max_value: 464
+    step: 0.005               # 5 kHz — fine enough to hunt an off-center remote
+    initial_value: ${def_freq_mhz}
+    restore_value: true
+    optimistic: true
+  - platform: template
+    id: cfg_bitrate
+    name: "Bitrate"
+    icon: mdi:speedometer
+    unit_of_measurement: "kBd"
+    mode: box
+    min_value: 1
+    max_value: 300
+    step: 1
+    initial_value: ${def_bitrate_kbd}   # 100 = proven; 10 = deaf
+    restore_value: true
+    optimistic: true
+  - platform: template
+    id: cfg_bandwidth
+    name: "Bandwidth"
+    icon: mdi:waveform
+    unit_of_measurement: "kHz"
+    mode: box
+    min_value: 58
+    max_value: 812
+    step: 1                   # driver snaps to the nearest legal step
+    initial_value: ${def_bandwidth_khz}
+    restore_value: true
+    optimistic: true
+  - platform: template
+    id: cfg_watchdog
+    name: "RX Watchdog"
+    icon: mdi:timer-alert
+    unit_of_measurement: "min"
+    mode: box
+    min_value: 0              # 0 = disabled
+    max_value: 120
+    step: 1
+    initial_value: 0
+    restore_value: true
+    optimistic: true
+
+button:
+  - platform: template
+    name: "Apply Radio Settings"
+    icon: mdi:radio-tower
+    on_press:
+      - script.execute: radio_apply
+  - platform: template
+    name: "Restart Radio"
+    icon: mdi:restart
+    on_press:
+      - lambda: id(mycc1101).standby();
+      - script.execute: radio_apply
+      - lambda: ESP_LOGW("sniffer", "radio restarted");
+  - platform: template
+    name: "Reset Statistics"
+    icon: mdi:counter
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          id(chunks_seen) = 0;
+          id(frames_decoded) = 0;
+          id(presses_seen) = 0;
+          id(last_frame_txt).publish_state("—");
+          ESP_LOGI("sniffer", "statistics reset");
+
+sensor:
+  - platform: template
+    id: rssi_dbm
+    name: "RSSI"
+    unit_of_measurement: "dBm"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: 'return id(mycc1101).getRSSI();'
+  - platform: template
+    name: "Chunks Captured"
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: 'return (float) id(chunks_seen);'
+  - platform: template
+    name: "Frames Decoded"
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: 'return (float) id(frames_decoded);'
+  - platform: template
+    name: "Presses"
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: 'return (float) id(presses_seen);'
+
+text_sensor:
+  - platform: template
+    id: last_frame_txt
+    name: "Last Frame"
+    icon: mdi:remote
+    # published by the decoder below; no polling lambda
+
+# -----------------------------------------------------------------------------
+# STATUS LED — onboard WS2812, internal (never appears in HA), painted below.
+#   red    a component is in error state (boot/runtime failure)
+#   amber  the radio is not online (see the probe: no SPI answer, or the
+#          driver reported an init error, or it is not parked in receive)
+#   white  flash on every capture (~120ms)
+#   green  booted and healthy (dim)
+# rmt_symbols: this sniffer has no remote_transmitter, so the RMT *transmit*
+# pool is free and the strip driver's 192-symbol default would be harmless.
+# Pinned to one block anyway — on the bridges that default starves
+# remote_transmitter ("no free tx channels") and kills radio TX at boot.
+# -----------------------------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_rgb
+    name: "Status LED"
+    internal: true
+    pin: ${pin_status_led}
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+    rmt_symbols: 48
+
+interval:
+  # RX watchdog: an unattended rig that stops hearing anything for N minutes
+  # gets its radio re-initialized. Disabled (0) by default — a quiet band is
+  # not a fault.
+  - interval: 30s
+    then:
+      - lambda: |-
+          const uint32_t mins = (uint32_t) id(cfg_watchdog).state;
+          if (mins == 0) return;
+          if (millis() - id(last_rx_ms) < mins * 60000UL) return;
+          ESP_LOGW("sniffer", "watchdog: no captures for %u min — restarting radio", mins);
+          id(mycc1101).standby();
+          id(radio_apply)->execute();
+
+  # RADIO-ONLINE PROBE. RadioLib: the VERSION register reads 0x14 (or legacy
+  # 0x04) only when a CC1101 is connected and answering. Note the component
+  # never calls mark_failed(), so a missing radio would otherwise go
+  # completely unreported. Honest limit: this detects a radio that is ABSENT,
+  # miswired, or failed to initialize — it cannot detect a chip that answers
+  # SPI perfectly yet is deaf on the air. We have owned exactly such a module.
+  - interval: 2s
+    then:
+      - lambda: |-
+          const uint8_t ver = id(mycc1101).radio.SPIgetRegValue(RADIOLIB_CC1101_REG_VERSION);
+          const bool chip_ok = (ver == RADIOLIB_CC1101_VERSION_CURRENT ||
+                                ver == RADIOLIB_CC1101_VERSION_LEGACY);
+          const bool drv_ok  = (id(mycc1101).init_state == 0) &&
+                               (id(mycc1101).state == radiolib_cc1101::CC1101_RECV);
+          const bool now_ok = chip_ok && drv_ok;
+          if (now_ok != id(radio_online))
+            ESP_LOGW("sniffer", "radio %s (VERSION=0x%02X init_state=%d)",
+                     now_ok ? "ONLINE" : "OFFLINE", ver, id(mycc1101).init_state);
+          id(radio_online) = now_ok;
+
+  # STATUS-LED PAINTER. Priority: error > radio offline > RX flash > healthy.
+  # The state cache means a light call is only issued on an actual change.
+  - interval: 100ms
+    then:
+      - lambda: |-
+          static uint8_t last_state = 255;
+          uint8_t s;
+          if (App.get_app_state() & STATUS_LED_ERROR)              s = 0;  // red
+          else if (!id(radio_online))                              s = 1;  // amber
+          else if (millis() - id(rx_flash_ms) < 120)               s = 2;  // white
+          else                                                     s = 3;  // green
+          if (s == last_state) return;
+          last_state = s;
+          // Brightness is per-channel, so a 3-channel white looks far brighter
+          // than a 1-channel green at the same value. These are balanced by
+          // eye, not by number: white is the flash, green is a calm idle.
+          float r = 0, g = 0, b = 0, br = 0.45f;
+          switch (s) {
+            case 0: r = 1;                              break;  // red   : error
+            case 1: r = 1; g = 0.45f;                   break;  // amber : radio offline
+            case 2: r = 1; g = 1; b = 1;  br = 0.50f;   break;  // white : packet
+            case 3: g = 1;                br = 0.25f;   break;  // green : healthy
+          }
+          static const char *const NAMES[] = {"red/error", "amber/radio-offline",
+                                              "white/packet", "green/healthy"};
+          ESP_LOGD("sniffer", "led -> %s", NAMES[s]);
+          auto call = id(status_rgb).turn_on();
+          call.set_transition_length(0);
+          call.set_rgb(r, g, b);
+          call.set_brightness(br);
+          call.perform();
+
+remote_receiver:
+  id: rf_receiver
+  pin:
+    number: ${pin_rx}
+    mode:
+      input: true
+      pullup: true
+  idle: ${rx_idle}
+  filter: ${rx_glitch}
+  buffer_size: 10kb
+  tolerance: 35%
+  on_raw:
+    - lambda: |-
+        id(chunks_seen)++;
+        id(last_rx_ms) = millis();   // any RF activity feeds the watchdog
+
+        // ---------------- RAW MODE: print the pulse list -----------------
+        // Marks positive us, spaces negative. Chunked into readable lines.
+        if (id(log_mode).current_option() == "Raw Pulses") {   // .state is deprecated
+          // In raw mode every capture IS the signal you are watching, so the
+          // LED flashes on each chunk. (In decode mode it flashes only on a
+          // real packet — noise chunks are not packets.)
+          id(rx_flash_ms) = millis();
+          ESP_LOGI("raw", "---- chunk: %u edges ----", (unsigned) x.size());
+          char buf[160];
+          int pos = 0, count = 0;
+          buf[0] = '\0';
+          for (int32_t v : x) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%ld ", (long) v);
+            if (++count % 16 == 0 || pos > 120) {
+              ESP_LOGI("raw", "  %s", buf);
+              pos = 0; buf[0] = '\0';
+            }
+          }
+          if (pos > 0) ESP_LOGI("raw", "  %s", buf);
+          return;
+        }
+
+        // -------------- B99 DECODE: scan-window decoder ------------------
+        // A clean chunk is [32 bit marks/spaces][next repeat's 250us sync
+        // mark]. Noise can prepend slivers (the 120us glitch filter lets
+        // anything >=120us through), so scan for the first window of 32
+        // consecutive bit-shaped marks. bit 1 = long mark (~759us),
+        // bit 0 = short mark (~251us).
+        std::vector<int32_t> marks;
+        for (int32_t v : x)
+          if (v > 0) marks.push_back(v);
+        if (marks.size() < 32) return;         // sync-only chunk or noise
+        const int n = (int) marks.size();
+        uint32_t frame = 0;
+        bool found = false;
+        for (int s = 0; s + 32 <= n && !found; s++) {
+          uint32_t f = 0;
+          bool ok = true;
+          for (int i = 0; i < 32; i++) {
+            const int32_t m = marks[s + i];
+            if (m < 100 || m > 1000) { ok = false; break; }
+            f = (f << 1) | (m > 500 ? 1u : 0u);
+          }
+          if (ok) { frame = f; found = true; }
+        }
+        if (!found) return;                    // noise chunk — silently dropped
+        id(frames_decoded)++;
+        id(rx_flash_ms) = millis();            // white flash: a real packet arrived
+
+        const uint32_t rid  = frame >> 12;          // 20-bit remote ID
+        const uint8_t  cmd  = (frame >> 7) & 0x1F;  // 5-bit command
+        const uint8_t  cnt  = (frame >> 4) & 0x7;   // 3-bit rolling counter
+        const uint8_t  csum = frame & 0xF;          // 4-bit checksum
+        // checksum = nibble(bits11-8) ^ nibble(bits7-4) ^ K  =>  solve for K
+        const uint8_t  K = ((frame >> 8) & 0xF) ^ ((frame >> 4) & 0xF) ^ csum;
+
+        const char *name;
+        switch (cmd) {
+          case 0x06: name = "All Off";   break;
+          case 0x16: name = "Fan Off";   break;
+          case 0x08: name = "Light";     break;
+          case 0x04: name = "Forward";   break;
+          case 0x11: name = "Reverse";   break;
+          case 0x15: name = "Variable";  break;
+          case 0x10: name = "Speed 1";   break;
+          case 0x12: name = "Speed 2";   break;
+          case 0x1C: name = "Speed 3";   break;
+          case 0x0A: name = "Speed 4";   break;
+          case 0x0F: name = "Speed 5";   break;
+          case 0x0C: name = "Speed 6";   break;
+          case 0x02: name = "Timer 1h";  break;
+          case 0x09: name = "Timer 2h";  break;
+          case 0x19: name = "Timer 4h";  break;
+          default:   name = "?";         break;
+        }
+
+        // One physical press is ~10 identical repeats; the counter increments
+        // per press, so a re-press of the same button still differs.
+        static uint32_t last_frame = 0;
+        static uint32_t last_ms = 0;
+        const uint32_t now = millis();
+        const bool new_press = (frame != last_frame) || (now - last_ms > 2000);
+        last_frame = frame;
+        last_ms = now;
+
+        ESP_LOGI("b99", "frame=0x%08X id=0x%05X (%u) cmd=0x%02X (%s) cnt=%u csum=0x%X -> K=0x%X (%u) rssi=%.0fdBm%s",
+                 (unsigned) frame, (unsigned) rid, (unsigned) rid,
+                 (unsigned) cmd, name, (unsigned) cnt, (unsigned) csum,
+                 (unsigned) K, (unsigned) K, id(mycc1101).getRSSI(),
+                 new_press ? "  <-- press" : "");
+
+        if (new_press) {
+          id(presses_seen)++;
+          char t[128];
+          snprintf(t, sizeof(t), "id=%u (0x%05X)  K=%u  %s  cnt=%u",
+                   (unsigned) rid, (unsigned) rid, (unsigned) K, name, (unsigned) cnt);
+          id(last_frame_txt).publish_state(t);
+        }
