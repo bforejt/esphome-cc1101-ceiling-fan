@@ -245,10 +245,23 @@ it never appears in HA):
 | blue | Wi-Fi up, no HA client connected |
 | dim green | healthy |
 
+**Dark Mode.** A `switch.dark_mode` entity (config category) fully extinguishes
+the status LED, so the board doesn't light a bedroom. It's a plain switch, so
+Home Assistant can automate it (on at bedtime, off at sunrise) or drive it by
+voice, and the setting **survives reboots and OTA updates** — an update at 2am
+won't relight it. Dark is absolute: even a component error stays dark, since HA
+reports failures far better than a red pixel at 3am.
+
+> **It cannot make the board *totally* dark.** The ESP32-S3-DevKitM-1's 3.3 V
+> power LED is wired to the power rail, not to a GPIO — Espressif's user guide
+> says it simply *"turns on when the USB power is connected."* No firmware can
+> switch it off. Cover it with opaque tape, or remove the LED or its series
+> resistor, if you need true darkness. (The CC1101 module has no LED.)
+
 The data pin is the `pin_status_led` substitution (DevKitM-1 = GPIO48; some
 DevKitC-1 v1.0 boards = GPIO38). A WS2812 can't be probed at runtime, but
 driving a pin with no LED attached is harmless — boards without one can keep
-the feature or delete the five blocks fenced `STATUS-LED (n/5)` in the YAML.
+the feature or delete the six blocks fenced `STATUS-LED (n/6)` in the YAML.
 
 An **external NeoPixel works identically**: wire its DIN to any free
 output-capable GPIO (avoid this project's 5/6/10–13 and the S3's flash pins
