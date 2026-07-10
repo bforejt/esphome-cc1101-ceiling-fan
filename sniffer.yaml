@@ -35,6 +35,22 @@
 #    Readouts
 #      RSSI, Chunks Captured, Frames Decoded, Presses, Last Frame
 #
+#  STATUS LED (onboard WS2812, or any NeoPixel on a free GPIO):
+#      red     a component is in error state
+#      amber   the radio is not online
+#      white   flashes on every capture
+#      green   booted and healthy
+#    "Radio not online" is a real probe, not a guess: RadioLib's VERSION
+#    register answers 0x14 (or legacy 0x04) only when a CC1101 is connected
+#    and responding, and the driver's init_state must be clean with the radio
+#    parked in receive. The component never calls mark_failed(), so without
+#    this probe a missing radio would go completely unreported.
+#    PLEASE NOTE the honest limit: this catches a radio that is ABSENT,
+#    miswired, or failed to init. It CANNOT catch a chip that answers SPI
+#    perfectly yet is deaf on the air — this project owned exactly such a
+#    module, and it cost days. Green means "the radio is talking to us", not
+#    "the radio can hear".
+#
 #  ---------------------------------------------------------------------------
 #  HOW TO PULL A REMOTE'S ID / K
 #    1. Flash, open the web page, leave Log Mode on "B99 Decode".
@@ -67,6 +83,13 @@ substitutions:
   device_name: sniffer
   friendly_name: "433 Sniffer"
   pin_rx: "6"                  # GDO2 (bridges' RX wire). "5" = GDO0 (native).
+
+  # ---- STATUS LED (optional). Onboard WS2812 on the ESP32-S3-DevKitM-1 is
+  # ---- GPIO48 (some DevKitC-1 v1.0 boards use GPIO38). An external NeoPixel
+  # ---- on any free output-capable GPIO works identically. A WS2812 cannot be
+  # ---- probed at runtime, but driving a pin with no LED attached is harmless,
+  # ---- so this is safe to leave enabled on boards without one.
+  pin_status_led: "48"
 
   # ---- First-boot RF defaults. All three are runtime-tunable from the web
   # ---- page; the numbers restore from flash and are re-applied at boot.
@@ -173,6 +196,14 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: '0'
+  - id: rx_flash_ms          # last capture (millis) — drives the white LED flash
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: radio_online         # refreshed by the probe below; drives the amber LED
+    type: bool
+    restore_value: false
+    initial_value: 'true'
 
 # -----------------------------------------------------------------------------
 # RADIO CONTROL. setup_direct_mode() is the driver's own retune path: standby
@@ -313,10 +344,35 @@ text_sensor:
     icon: mdi:remote
     # published by the decoder below; no polling lambda
 
-# RX watchdog: an unattended rig that stops hearing anything for N minutes
-# gets its radio re-initialized. Disabled (0) by default — a quiet band is
-# not a fault.
+# -----------------------------------------------------------------------------
+# STATUS LED — onboard WS2812, internal (never appears in HA), painted below.
+#   red    a component is in error state (boot/runtime failure)
+#   amber  the radio is not online (see the probe: no SPI answer, or the
+#          driver reported an init error, or it is not parked in receive)
+#   white  flash on every capture (~120ms)
+#   green  booted and healthy (dim)
+# rmt_symbols: this sniffer has no remote_transmitter, so the RMT *transmit*
+# pool is free and the strip driver's 192-symbol default would be harmless.
+# Pinned to one block anyway — on the bridges that default starves
+# remote_transmitter ("no free tx channels") and kills radio TX at boot.
+# -----------------------------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_rgb
+    name: "Status LED"
+    internal: true
+    pin: ${pin_status_led}
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+    rmt_symbols: 48
+
 interval:
+  # RX watchdog: an unattended rig that stops hearing anything for N minutes
+  # gets its radio re-initialized. Disabled (0) by default — a quiet band is
+  # not a fault.
   - interval: 30s
     then:
       - lambda: |-
@@ -326,6 +382,52 @@ interval:
           ESP_LOGW("sniffer", "watchdog: no captures for %u min — restarting radio", mins);
           id(mycc1101).standby();
           id(radio_apply)->execute();
+
+  # RADIO-ONLINE PROBE. RadioLib: the VERSION register reads 0x14 (or legacy
+  # 0x04) only when a CC1101 is connected and answering. Note the component
+  # never calls mark_failed(), so a missing radio would otherwise go
+  # completely unreported. Honest limit: this detects a radio that is ABSENT,
+  # miswired, or failed to initialize — it cannot detect a chip that answers
+  # SPI perfectly yet is deaf on the air. We have owned exactly such a module.
+  - interval: 2s
+    then:
+      - lambda: |-
+          const uint8_t ver = id(mycc1101).radio.SPIgetRegValue(RADIOLIB_CC1101_REG_VERSION);
+          const bool chip_ok = (ver == RADIOLIB_CC1101_VERSION_CURRENT ||
+                                ver == RADIOLIB_CC1101_VERSION_LEGACY);
+          const bool drv_ok  = (id(mycc1101).init_state == 0) &&
+                               (id(mycc1101).state == radiolib_cc1101::CC1101_RECV);
+          const bool now_ok = chip_ok && drv_ok;
+          if (now_ok != id(radio_online))
+            ESP_LOGW("sniffer", "radio %s (VERSION=0x%02X init_state=%d)",
+                     now_ok ? "ONLINE" : "OFFLINE", ver, id(mycc1101).init_state);
+          id(radio_online) = now_ok;
+
+  # STATUS-LED PAINTER. Priority: error > radio offline > RX flash > healthy.
+  # The state cache means a light call is only issued on an actual change.
+  - interval: 100ms
+    then:
+      - lambda: |-
+          static uint8_t last_state = 255;
+          uint8_t s;
+          if (App.get_app_state() & STATUS_LED_ERROR)              s = 0;  // red
+          else if (!id(radio_online))                              s = 1;  // amber
+          else if (millis() - id(rx_flash_ms) < 120)               s = 2;  // white
+          else                                                     s = 3;  // green
+          if (s == last_state) return;
+          last_state = s;
+          float r = 0, g = 0, b = 0, br = 0.35f;
+          switch (s) {
+            case 0: r = 1;                              break;  // red   : error
+            case 1: r = 1; g = 0.45f;                   break;  // amber : radio offline
+            case 2: r = 1; g = 1; b = 1;  br = 0.60f;   break;  // white : receiving
+            case 3: g = 1;                br = 0.10f;   break;  // green : healthy
+          }
+          auto call = id(status_rgb).turn_on();
+          call.set_transition_length(0);
+          call.set_rgb(r, g, b);
+          call.set_brightness(br);
+          call.perform();
 
 remote_receiver:
   id: rf_receiver
@@ -342,6 +444,7 @@ remote_receiver:
     - lambda: |-
         id(chunks_seen)++;
         id(last_rx_ms) = millis();
+        id(rx_flash_ms) = millis();   // white LED flash on every capture
 
         // ---------------- RAW MODE: print the pulse list -----------------
         // Marks positive us, spaces negative. Chunked into readable lines.

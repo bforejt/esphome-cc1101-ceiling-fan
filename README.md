@@ -560,6 +560,24 @@ Home Assistant if you connect it):
 Readouts: **RSSI**, **Chunks Captured**, **Frames Decoded**, **Presses**, and
 **Last Frame** (the decoded `id` / `K` / command).
 
+It also drives a **status NeoPixel** (onboard WS2812 on GPIO48, or any
+NeoPixel on a free GPIO via `pin_status_led`):
+
+| Color | Meaning |
+|---|---|
+| red | a component is in error state |
+| amber | the radio is not online |
+| white flash | a capture arrived |
+| green | booted and healthy |
+
+"Radio not online" is a real probe, not a guess: RadioLib's `VERSION` register
+answers `0x14` only when a CC1101 is connected and responding, and the
+driver's `init_state` must be clean with the radio parked in receive. (The
+component never marks itself failed, so without this a missing radio would go
+unreported.) **Its honest limit:** it catches a radio that is *absent,
+miswired, or failed to init* — not one that answers SPI perfectly yet is deaf
+on the air. Green means *the radio is talking to us*, not *the radio can hear*.
+
 To extract a remote's values:
 
 1. Flash `sniffer.yaml`, open its web page, leave **Log Mode** on `B99 Decode`.
