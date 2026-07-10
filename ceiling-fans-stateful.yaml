@@ -73,11 +73,14 @@
 #    - Frames from OUR remotes (ID + checksum-K must BOTH match) update the
 #      entities through the suppressed state-sync path (no re-transmit); the
 #      native API pushes the change to Home Assistant live.
-#      Command mapping: Speed N -> on/speed/exits breeze; Fan Off -> off;
+#      Command mapping: Speed N -> on/speed/exits breeze, and from a STOP it
+#      also mirrors the verified forward restart (unless HA had a pending
+#      direction set while off, which is then transmitted); Fan Off -> off;
 #      All Off -> fan+light off; Light -> FLIPS assumed light state;
-#      F/R -> direction (entity-only when fan off: converges via the
-#      deferred-direction settle on next turn-on); Variable -> Breeze;
-#      Timers -> logged only (no state claim).
+#      F/R -> direction, and from a STOP it also mirrors the fan STARTING at
+#      its remembered speed; Variable -> Breeze; Timers -> logged only.
+#      Both remote-initiated start paths therefore leave assumed state in
+#      agreement with the fan, instead of HA showing "off" while it spins.
 #    - The TX rolling counter resyncs to (heard counter + 1) so our next
 #      transmit continues the remote's sequence.
 #    - UNKNOWN IDs are logged at INFO (tag "rx_discover") with id/cmd/cnt and
@@ -1089,19 +1092,34 @@ remote_receiver:
         // (the All Off button pattern): no RF goes out, HA updates live.
         id(suppress_tx) = true;
         if (spd > 0) {
+          // Capture BEFORE mutating anything. "entity direction != assumed
+          // physical direction" is precisely the signal that the HA user set
+          // a direction while the fan was off (a pending wish); the two agree
+          // in every other situation. Overwriting g_fwd first would erase it.
+          const bool was_off  = !g_on;
+          const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
+          const bool pending  = was_off && (want_fwd != g_fwd);
+
           g_on = true; g_breeze = false; g_speed = (uint8_t) spd;
           auto call = f->make_call();
           call.set_state(true);
           call.set_speed(spd);   // FanCall validation clears any preset
+          if (was_off && !pending) {
+            // Verified: a Speed command starts a stopped fan FORWARD, whatever
+            // direction it last ran in. With no pending wish to honour, mirror
+            // that reality rather than carry a stale assumption forward.
+            call.set_direction(fan::FanDirection::FORWARD);
+            g_fwd = true;
+          }
           call.perform();
-          ESP_LOGI("rx_b99", "%s remote: Speed %d (cnt=%u)", who, spd, cnt);
-          // Deferred-direction settle: if HA set a direction while the fan
-          // was off (entity direction != assumed physical), the remote just
-          // turned the fan on — apply the user's pending direction now.
-          // The reconciler can't do it (this sync runs suppressed), and
-          // script.execute is not gated by suppress_tx.
-          const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
-          if (want_fwd != g_fwd) {
+          ESP_LOGI("rx_b99", "%s remote: Speed %d (%s, cnt=%u)", who, spd,
+                   was_off ? "started stopped fan" : "fan running", cnt);
+          // Deferred-direction settle: the remote just started the fan, so
+          // apply the direction the HA user set while it was off. The fan came
+          // up forward, so this transmits the wish. The reconciler cannot do
+          // it (it early-returns while suppressed), but script.execute is not
+          // gated by suppress_tx.
+          if (pending) {
             id(tx_send).execute(unit, u_id, u_k, want_fwd ? 0x04 : 0x11, u_freq);
             g_fwd = want_fwd;
             ESP_LOGI("rx_b99", "%s: settling deferred direction -> %s", who, want_fwd ? "Forward" : "Reverse");
@@ -1123,18 +1141,27 @@ remote_receiver:
                    who, g_light ? "ON" : "OFF", cnt);
         } else if (cmd == 0x04 || cmd == 0x11) {   // Forward / Reverse
           const bool fwd = (cmd == 0x04);
+          const bool was_on = g_on;
           auto call = f->make_call();
           call.set_direction(fwd ? fan::FanDirection::FORWARD
                                  : fan::FanDirection::REVERSE);
+          if (!was_on) {
+            // Verified: F/R on a stopped fan STARTS it, at its remembered
+            // speed, in the pressed direction. Mirror that start. Without
+            // this HA shows the fan off while it spins — and worse, the
+            // reconciler's OFF branch is guarded on the assumed on-flag, so
+            // HA cannot stop it until the state is resynced.
+            call.set_state(true);
+            call.set_speed((int) g_speed);   // also clears any stale preset
+          }
           call.perform();
-          // Running: the fan applied it (validated) -> update the physical
-          // assumption. Off: whether F/R moves a stopped fan is unverified,
-          // so update the ENTITY only — the reconciler's deferred-direction
-          // settle transmits F/R on the next turn-on and converges either
-          // way.
-          if (g_on) g_fwd = fwd;
-          ESP_LOGI("rx_b99", "%s remote: %s (fan %s, cnt=%u)",
-                   who, fwd ? "Forward" : "Reverse", g_on ? "running" : "off", cnt);
+          // The fan applied the direction either way: while running
+          // (validated), or by starting with it (verified).
+          g_on = true;
+          g_fwd = fwd;
+          ESP_LOGI("rx_b99", "%s remote: %s (%s, cnt=%u)",
+                   who, fwd ? "Forward" : "Reverse",
+                   was_on ? "fan running" : "started stopped fan", cnt);
         } else if (cmd == 0x15) {          // Variable -> Breeze preset
           g_on = true; g_breeze = true;
           auto call = f->make_call();
@@ -1142,7 +1169,16 @@ remote_receiver:
           call.set_preset_mode("Breeze");
           call.perform();
           ESP_LOGI("rx_b99", "%s remote: Variable -> Breeze (cnt=%u)", who, cnt);
-          // Same deferred-direction settle as the Speed path.
+          // Deferred-direction settle, kept in its ORIGINAL un-gated form —
+          // deliberately NOT the Speed path's version. The Speed path can
+          // force g_fwd forward on a start-from-stop because we verified a
+          // Speed command restarts a stopped fan forward. Whether a Variable
+          // (natural-wind) command does the same is UNVERIFIED, so we do not
+          // guess: this path leaves the assumed direction alone. If a bench
+          // test shows Variable also restarts forward, mirror the Speed path
+          // here (force forward when starting from a stop with no pending
+          // wish). Until then a Breeze start from a stop may leave a stale
+          // direction assumption, self-healing on the next turn-on assert.
           const bool want_fwd = f->direction != fan::FanDirection::REVERSE;
           if (want_fwd != g_fwd) {
             id(tx_send).execute(unit, u_id, u_k, want_fwd ? 0x04 : 0x11, u_freq);
