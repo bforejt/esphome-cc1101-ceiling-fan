@@ -122,7 +122,7 @@ substitutions:
   green_id_dec: "6480"         # 20-bit ID 0x01950 (captured via rx_discover)
   green_k: "7"                 # checksum key 0x7 (validated across many frames)
   green_freq_mhz: "433.92"     # remote received cleanly at 433.92 (RSSI -74dBm)
-  # ---- STATUS-LED (1/5, optional) -----------------------------------------
+  # ---- STATUS-LED (1/6, optional) -----------------------------------------
   # Onboard WS2812 data pin: ESP32-S3-DevKitM-1 = GPIO48 (per Espressif's
   # user guide); some DevKitC-1 v1.0 boards = GPIO38. A WS2812 cannot be
   # probed at runtime, but driving a pin with no LED attached is harmless —
@@ -374,7 +374,7 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: '0'
-  # ---- STATUS-LED (2/5, optional) — last accepted RX press (millis). The
+  # ---- STATUS-LED (2/6, optional) — last accepted RX press (millis). The
   # ---- write in the RX dispatch is harmless if the LED sections are removed.
   - id: rx_last_ms
     type: uint32_t
@@ -644,7 +644,7 @@ output:
           id(green_light_on) = state;
 
 light:
-  # ---- STATUS-LED (3/5, optional) — the onboard WS2812, internal (not a
+  # ---- STATUS-LED (3/6, optional) — the onboard WS2812, internal (not a
   # ---- user light; painted by the interval below).
   - platform: esp32_rmt_led_strip
     id: status_rgb
@@ -678,16 +678,50 @@ light:
     output: green_light_out
     restore_mode: RESTORE_DEFAULT_OFF
 
-# ---- STATUS-LED (4/5, optional) — the painter. Priority order: component
-# ---- error (red) > warning (yellow) > wifi down (orange) > RX decoded
-# ---- (cyan, ~1.5s) > transmitting (white, ~0.6s) > no HA client (blue) >
-# ---- healthy (dim green). Event colors self-restore on the next tick; the
-# ---- state cache keeps this from spamming light calls every 250ms.
+# ---- STATUS-LED (4/6, optional) — Dark Mode. Fully extinguishes the status
+# ---- LED so the board does not light a bedroom. Exposed to Home Assistant
+# ---- as a plain switch: automatable (bedtime on, sunrise off) and
+# ---- voice-controllable. RESTORE_DEFAULT_OFF means the setting survives
+# ---- reboots and OTA updates — an update at 2am must not relight the LED.
+# ---- Dark is ABSOLUTE: even a component error stays dark, because HA
+# ---- surfaces failures far better than a red pixel at 3am.
+# ---- PLEASE NOTE this cannot make the board *totally* dark. The
+# ---- ESP32-S3-DevKitM-1's 3.3V power LED is wired to the power rail, not to
+# ---- a GPIO, so no firmware can switch it off (Espressif: "Turns on when
+# ---- the USB power is connected"). Cover it with opaque tape, or remove the
+# ---- LED / its series resistor, if you need true darkness.
+switch:
+  - platform: template
+    id: dark_mode
+    name: "Dark Mode"
+    icon: mdi:weather-night
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# ---- STATUS-LED (5/6, optional) — the painter. Priority order: dark mode >
+# ---- component error (red) > warning (yellow) > wifi down (orange) > RX
+# ---- decoded (cyan, ~1.5s) > transmitting (white, ~0.6s) > no HA client
+# ---- (blue) > healthy (dim green). Event colors self-restore on the next
+# ---- tick; the state cache keeps this from spamming light calls every 250ms.
 interval:
   - interval: 250ms
     then:
       - lambda: |-
           static uint8_t last_state = 255;
+          // Dark mode: extinguish once, then paint nothing. The 254 sentinel
+          // means any later state differs from it, so leaving dark mode
+          // repaints on the next tick — no extra flags or handlers needed.
+          if (id(dark_mode).state) {
+            if (last_state != 254) {
+              auto off = id(status_rgb).turn_off();
+              off.set_transition_length(0);
+              off.perform();
+              last_state = 254;
+              ESP_LOGD("status_led", "dark mode: LED off");
+            }
+            return;
+          }
           const uint32_t ms = millis();
           const uint8_t app = App.get_app_state();
           uint8_t s;
@@ -1049,7 +1083,7 @@ remote_receiver:
         if (frame == last_frame && (now - last_ms) < 2000) { last_ms = now; return; }
         last_frame = frame;
         last_ms = now;
-        // STATUS-LED (5/5, optional): note the accepted press for the LED
+        // STATUS-LED (6/6, optional): note the accepted press for the LED
         // painter; harmless if the LED sections are removed.
         id(rx_last_ms) = now;
 
