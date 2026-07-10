@@ -131,8 +131,9 @@ esphome:
           // one thing RadioLib will not do for us: route demodulated RX data
           // to GDO2 as well as GDO0 (its async direct mode only sets IOCFG0).
           id(radio_apply)->execute();
+          // current_option() — Select::state is deprecated, removed in 2026.7.0
           ESP_LOGI("sniffer", "ready on GPIO%d — %s mode", ${pin_rx},
-                   id(log_mode).state.c_str());
+                   id(log_mode).current_option().c_str());
 
 esp32:
   board: esp32-s3-devkitm-1
@@ -448,7 +449,7 @@ remote_receiver:
 
         // ---------------- RAW MODE: print the pulse list -----------------
         // Marks positive us, spaces negative. Chunked into readable lines.
-        if (id(log_mode).state == "Raw Pulses") {
+        if (id(log_mode).current_option() == "Raw Pulses") {   // .state is deprecated
           ESP_LOGI("raw", "---- chunk: %u edges ----", (unsigned) x.size());
           char buf[160];
           int pos = 0, count = 0;
