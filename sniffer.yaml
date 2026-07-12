@@ -19,6 +19,11 @@
 #  WEB UI (http://<device>/ — also exposed to Home Assistant if you use it):
 #    Controls
 #      Log Mode         select: "B99 Decode" (default) or "Raw Pulses"
+#      (per-chunk RSSI)  every capture logs a DEBUG "chunk" line with its
+#                        edge count and RSSI, in either mode — grep the
+#                        "chunk" tag for an RSSI scan of the band. (RSSI is
+#                        sampled at the callback, just after the chunk, so
+#                        it reads nearer the noise floor than the peak.)
 #      RX Attenuation   select: 0 / 6 / 12 / 18 dB (CLOSE_IN_RX). More
 #                       attenuation = less sensitivity = only strong / nearby
 #                       signals slice. Raise it to cut neighborhood OOK
@@ -509,6 +514,18 @@ remote_receiver:
         id(chunks_seen)++;
         id(last_rx_ms) = millis();   // any RF activity feeds the watchdog
 
+        // Per-chunk RSSI, captured once and reused below. HONEST CAVEAT:
+        // getRSSI() reads the register when this callback fires — ~5.5ms (the
+        // idle gap) AFTER the chunk's last edge, in the quiet before any next
+        // repeat. So it tracks the noise floor just after the chunk more than
+        // the chunk's peak; treat it as a rough level/environment gauge, not
+        // a calibrated peak. Logged for EVERY chunk at DEBUG so the INFO
+        // stream stays clean (a decoded chunk still gets its b99 line, a raw
+        // chunk its dump). Grep the "chunk" tag for an RSSI scan of the band.
+        const float rssi = id(mycc1101).getRSSI();
+        ESP_LOGD("chunk", "#%u  %u edges  rssi=%.0f dBm",
+                 (unsigned) id(chunks_seen), (unsigned) x.size(), rssi);
+
         // ---------------- RAW MODE: print the pulse list -----------------
         // Marks positive us, spaces negative. Chunked into readable lines.
         if (id(log_mode).current_option() == "Raw Pulses") {   // .state is deprecated
@@ -516,7 +533,8 @@ remote_receiver:
           // LED flashes on each chunk. (In decode mode it flashes only on a
           // real packet — noise chunks are not packets.)
           id(rx_flash_ms) = millis();
-          ESP_LOGI("raw", "---- chunk: %u edges ----", (unsigned) x.size());
+          ESP_LOGI("raw", "---- chunk #%u: %u edges, rssi=%.0f dBm ----",
+                   (unsigned) id(chunks_seen), (unsigned) x.size(), rssi);
           char buf[160];
           int pos = 0, count = 0;
           buf[0] = '\0';
@@ -597,13 +615,13 @@ remote_receiver:
         ESP_LOGI("b99", "frame=0x%08X id=0x%05X (%u) cmd=0x%02X (%s) cnt=%u csum=0x%X -> K=0x%X (%u) rssi=%.0fdBm%s",
                  (unsigned) frame, (unsigned) rid, (unsigned) rid,
                  (unsigned) cmd, name, (unsigned) cnt, (unsigned) csum,
-                 (unsigned) K, (unsigned) K, id(mycc1101).getRSSI(),
+                 (unsigned) K, (unsigned) K, rssi,
                  new_press ? "  <-- press" : "");
 
         if (new_press) {
           id(presses_seen)++;
           char t[128];
-          snprintf(t, sizeof(t), "id=%u (0x%05X)  K=%u  %s  cnt=%u",
-                   (unsigned) rid, (unsigned) rid, (unsigned) K, name, (unsigned) cnt);
+          snprintf(t, sizeof(t), "id=%u (0x%05X)  K=%u  %s  cnt=%u  %.0f dBm",
+                   (unsigned) rid, (unsigned) rid, (unsigned) K, name, (unsigned) cnt, rssi);
           id(last_frame_txt).publish_state(t);
         }
