@@ -113,6 +113,23 @@ substitutions:
   pin_rx: "6"                 # GDO2 - receive data (IOCFG2 routed at boot)
   sync_gap: "7750"            # EV1527 31T sync-gap (us); >=4000 required
   tx_pace: "450ms"            # >= RF airtime per command: 10 repeats x (~8ms sync + 32 x ~1ms) ~= 400ms
+  # ---- RX front-end tuning (RECEIVE-path only; does NOT affect transmit) ----
+  # These set the CC1101's DRATE (bitrate) and CHANBW (filter) registers. In
+  # async-serial OOK, transmit is the MCU/RMT keying GDO0 directly, so TX is
+  # independent of DRATE except for an 8x-oversampling edge grid (1/(8*DRATE)):
+  # at 20kBd that grid is 6.25us, ~2.5% of the 251us short pulse and ~40x inside
+  # the receiver's 35% width tolerance -- TX stays bench-proven. CHANBW is a
+  # pure receive filter and has no TX effect at all.
+  #   rx_bitrate 20  : bench-proven clean decode of a marginal/noisy remote.
+  #                    Coarser than 100 (default), so the 6.25us grid debounces
+  #                    sub-grid noise jitter the fine 1.25us grid (100kBd) passed
+  #                    through. Do NOT drop below ~10 -- the grid then approaches
+  #                    the 251us pulse and the short "0" bit starts crossing the
+  #                    759us "1" width boundary (intermittent bit errors).
+  #   rx_bandwidth 812 : widest CC1101 CHANBW; preserves the sharp OOK pulse
+  #                      edges a narrow IF filter would round/ring. Native step.
+  rx_bitrate: "20"
+  rx_bandwidth: "812"         # kHz; snapped to nearest CC1101 CHANBW (812 = native)
   # --- Office fan (unit 0) ---
   office_id_dec: "953"        # 20-bit ID 0x003B9
   office_k: "11"              # checksum key 0xB
@@ -278,7 +295,12 @@ remote_transmitter:
 radiolib_cc1101:
   id: mycc1101
   cs_pin: GPIO10
-  bitrate: 100
+  # DRATE / CHANBW are RECEIVE-path tuning (see the rx_bitrate / rx_bandwidth
+  # notes in substitutions). The per-TX setup_direct_mode() re-applies these
+  # from the component's _bitrate/_bandwidth members, so a single config here
+  # governs both the parked recv() front-end and post-TX re-tune.
+  bitrate: ${rx_bitrate}
+  filter: ${rx_bandwidth}kHz
   # RX data is routed to GDO2/GPIO6 by the IOCFG2 write in on_boot (RadioLib
   # only configures GDO0, which TX owns). rx_pin is deliberately NOT set: it
   # only feeds the component's opportunistic RSSI sampling, and leaving it
