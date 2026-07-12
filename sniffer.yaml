@@ -19,7 +19,11 @@
 #  WEB UI (http://<device>/ — also exposed to Home Assistant if you use it):
 #    Controls
 #      Log Mode         select: "B99 Decode" (default) or "Raw Pulses"
-#      Frequency        MHz, 5 kHz steps
+#      Frequency        MHz, 5 kHz steps. Full CC1101 span: 300-928, but only
+#                       the 300-348 / 387-464 / 779-928 bands lock (the gaps
+#                       are dead, and Apply warns). Your module's antenna/
+#                       matching is band-specific — a 433 module hears poorly
+#                       at 315 or 868.
 #      Bitrate          kBd — the CC1101 DRATE register. NOT the OOK symbol
 #                       rate; in async mode it sets the RX data-filter width.
 #                       100 is the PROVEN value. 10 went completely deaf on
@@ -219,7 +223,16 @@ script:
     mode: restart
     then:
       - lambda: |-
-          id(mycc1101)._freq      = id(cfg_freq).state;        // MHz
+          const float f = id(cfg_freq).state;                  // MHz
+          // The CC1101 only locks in three bands; warn on a gap frequency so
+          // "no captures" reads as "unlockable band", not a hardware fault.
+          const bool lockable = (f >= 300.0f && f <= 348.0f) ||
+                                (f >= 387.0f && f <= 464.0f) ||
+                                (f >= 779.0f && f <= 928.0f);
+          if (!lockable)
+            ESP_LOGW("sniffer", "%.3f MHz is outside the CC1101's lockable bands "
+                     "(300-348 / 387-464 / 779-928) — the PLL will not lock here", f);
+          id(mycc1101)._freq      = f;
           id(mycc1101)._bitrate   = id(cfg_bitrate).state;     // kBd (DRATE)
           id(mycc1101)._bandwidth = id(cfg_bandwidth).state;   // kHz (snapped)
           id(mycc1101).setup_direct_mode();
@@ -249,8 +262,16 @@ number:
     icon: mdi:sine-wave
     unit_of_measurement: "MHz"
     mode: box
-    min_value: 387            # CC1101 mid band (it also does 300-348, 779-928)
-    max_value: 464
+    # Full CC1101 tuning span. The chip supports THREE bands only —
+    # 300-348, 387-464, 779-928 MHz — and RadioLib rejects anything in the
+    # 348-387 or 464-779 gaps (the PLL cannot lock; Apply logs a warning and
+    # the radio-online LED goes amber). A single slider can't express three
+    # disjoint bands, so the range is the outer envelope; mind the gaps.
+    # Also: your MODULE's RF matching + antenna are tuned for one band. A
+    # 433 MHz E07-M1101D will hear poorly at 315 or 868 even though the chip
+    # tunes there — match the module to the band you want to sniff.
+    min_value: 300
+    max_value: 928
     step: 0.005               # 5 kHz — fine enough to hunt an off-center remote
     initial_value: ${def_freq_mhz}
     restore_value: true
