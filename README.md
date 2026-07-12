@@ -564,7 +564,7 @@ Home Assistant if you connect it):
 | Control | Purpose |
 |---|---|
 | **Log Mode** | `B99 Decode` (default) or `Raw Pulses` |
-| **Frequency** | MHz, 5 kHz steps — hunt an off-center remote (cheap SAW transmitters sit 100+ kHz off) |
+| **Frequency** | MHz, 5 kHz steps — hunt an off-center remote (cheap SAW transmitters sit 100+ kHz off). Full CC1101 span (300–928); only the 300–348 / 387–464 / 779–928 bands lock (the gaps are dead, and Apply warns). Your module's matching is band-specific — a 433 module hears poorly at 315/868. |
 | **Bitrate** | the CC1101 DRATE register (not the OOK symbol rate). **100 is the proven value**; 10 went completely deaf on known-good hardware |
 | **Bandwidth** | RX filter in kHz, snapped to the chip's legal steps. Widen for capture margin |
 | **RX Watchdog** | minutes without a capture before the radio auto-restarts; `0` = off |
