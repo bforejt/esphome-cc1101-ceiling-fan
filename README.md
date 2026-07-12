@@ -564,6 +564,7 @@ Home Assistant if you connect it):
 | Control | Purpose |
 |---|---|
 | **Log Mode** | `B99 Decode` (default) or `Raw Pulses` |
+| **RX Attenuation** | `0 / 6 / 12 / 18 dB` (the CC1101 CLOSE_IN_RX attenuator). More attenuation = less sensitivity = only strong / nearby transmitters slice — raise it to cut a noisy neighborhood's OOK chatter while your own remote (near the antenna) still decodes |
 | **Frequency** | MHz, 5 kHz steps — hunt an off-center remote (cheap SAW transmitters sit 100+ kHz off). Full CC1101 span (300–928); only the 300–348 / 387–464 / 779–928 bands lock (the gaps are dead, and Apply warns). Your module's matching is band-specific — a 433 module hears poorly at 315/868. |
 | **Bitrate** | the CC1101 DRATE register (not the OOK symbol rate). **100 is the proven value**; 10 went completely deaf on known-good hardware |
 | **Bandwidth** | RX filter in kHz, snapped to the chip's legal steps. Widen for capture margin |
