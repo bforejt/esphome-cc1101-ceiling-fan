@@ -24,6 +24,14 @@
 #                        "chunk" tag for an RSSI scan of the band. (RSSI is
 #                        sampled at the callback, just after the chunk, so
 #                        it reads nearer the noise floor than the peak.)
+#      Modulation       select: OOK (default) or FSK — which demodulator
+#                       drives the async data line. The tell for an FSK
+#                       remote heard in OOK mode: strong RSSI but every chunk
+#                       is a settle blip plus one solid mark that runs until
+#                       rx_idle closes the capture. Flip to FSK to see its
+#                       real bitstream. RX deviation stays at RadioLib's
+#                       default (±47.6 kHz); a wide Bandwidth forgives a
+#                       mismatch there.
 #      RX Attenuation   select: 0 / 6 / 12 / 18 dB (CLOSE_IN_RX). More
 #                       attenuation = less sensitivity = only strong / nearby
 #                       signals slice. Raise it to cut neighborhood OOK
@@ -120,7 +128,12 @@ substitutions:
   # ---- buffer overflows (a "Buffer overflow" flood means the radio IS
   # ---- hearing the remote — it is a frame-delimiting problem).
   rx_idle: "5500us"
-  rx_glitch: "120us"           # reject sub-bit noise glitches
+  # ---- Glitch filter: pulses shorter than this are MERGED into the
+  # ---- surrounding level, so it must sit below the shortest real symbol.
+  # ---- 120us was fine for the B99 fans (shortest mark ~250us) but renders
+  # ---- any faster protocol as one solid carrier — exactly what the porch
+  # ---- blinds remote produced. 40us still rejects sub-bit RF hash.
+  rx_glitch: "40us"
 
   # ---- AGC — DO NOT CHANGE. These are the component's stock SmartRC values
   # ---- and the only combination proven to receive on this hardware. TI
@@ -245,6 +258,10 @@ script:
           id(mycc1101)._freq      = f;
           id(mycc1101)._bitrate   = id(cfg_bitrate).state;     // kBd (DRATE)
           id(mycc1101)._bandwidth = id(cfg_bandwidth).state;   // kHz (snapped)
+          const bool fsk = id(rf_modulation).current_option() == "FSK";
+          id(mycc1101)._modulation = fsk
+              ? esphome::radiolib_cc1101::FSK_MODULATION
+              : esphome::radiolib_cc1101::OOK_MODULATION;
           id(mycc1101).setup_direct_mode();
           id(mycc1101).radio.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG2,
                                             RADIOLIB_CC1101_GDOX_SERIAL_DATA_ASYNC, 5, 0);
@@ -258,9 +275,9 @@ script:
           else if (atten == "18 dB") atten_bits = RADIOLIB_CC1101_RX_ATTEN_18_DB;
           id(mycc1101).radio.SPIsetRegValue(RADIOLIB_CC1101_REG_FIFOTHR, atten_bits, 5, 4);
           id(last_rx_ms) = millis();   // don't let the watchdog fire on a fresh apply
-          ESP_LOGI("sniffer", "radio: %.3f MHz, %.1f kBd, %.0f kHz BW, atten %s | IOCFG2=0x%02X",
+          ESP_LOGI("sniffer", "radio: %.3f MHz, %.1f kBd, %.0f kHz BW, %s, atten %s | IOCFG2=0x%02X",
                    id(mycc1101)._freq, id(mycc1101)._bitrate, id(mycc1101)._bandwidth,
-                   atten.c_str(),
+                   fsk ? "FSK" : "OOK", atten.c_str(),
                    (unsigned) id(mycc1101).radio.SPIgetRegValue(RADIOLIB_CC1101_REG_IOCFG2, 5, 0));
 
 select:
@@ -274,6 +291,19 @@ select:
     options:
       - "B99 Decode"
       - "Raw Pulses"
+  # Which demodulator feeds the async data line. The component's public
+  # _modulation member is applied by setup_direct_mode() via setOOK(), so
+  # this is runtime-switchable through the same Apply path as the numbers.
+  - platform: template
+    id: rf_modulation
+    name: "Modulation"
+    icon: mdi:radio
+    optimistic: true
+    restore_value: true
+    initial_option: "OOK"
+    options:
+      - "OOK"
+      - "FSK"
   # RX sensitivity, via the CC1101's CLOSE_IN_RX front-end attenuator
   # (FIFOTHR[5:4]). MORE attenuation = LESS sensitivity = only strong /
   # nearby transmitters slice, so it rejects the weak distant OOK chatter
@@ -551,8 +581,8 @@ remote_receiver:
 
         // -------------- B99 DECODE: scan-window decoder ------------------
         // A clean chunk is [32 bit marks/spaces][next repeat's 250us sync
-        // mark]. Noise can prepend slivers (the 120us glitch filter lets
-        // anything >=120us through), so scan for the first window of 32
+        // mark]. Noise can prepend slivers (anything longer than rx_glitch
+        // gets through), so scan for the first window of 32
         // consecutive bit-shaped marks. bit 1 = long mark (~759us),
         // bit 0 = short mark (~251us).
         std::vector<int32_t> marks;
