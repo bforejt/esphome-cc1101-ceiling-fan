@@ -261,6 +261,11 @@ web_server:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # Mains-powered bridge: disable WiFi modem-sleep. The ESP32 default is LIGHT
+  # (modem-sleep), which wakes only on DTIM beacons -- that adds latency to the
+  # first HA native-API command after idle and can drop the API keepalive
+  # (transient "unavailable"). NONE keeps the link hot; pure upside off-battery.
+  power_save_mode: none
 
 spi:
   clk_pin: GPIO12
