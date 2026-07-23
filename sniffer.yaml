@@ -238,8 +238,9 @@ globals:
 
 # -----------------------------------------------------------------------------
 # RADIO CONTROL. setup_direct_mode() is the driver's own retune path: standby
-# -> write registers (freq/bitrate/bandwidth/AGC) -> setOOK -> recv(). It only
-# configures GDO0, so we re-assert IOCFG2 afterwards for the GDO2 wire.
+# -> write registers (freq/bitrate/bandwidth/AGC/modulation) -> setOOK (applies
+# the selected OOK or FSK) -> recv(). It only configures GDO0, so we re-assert
+# IOCFG2 afterwards for the GDO2 wire.
 # -----------------------------------------------------------------------------
 script:
   - id: radio_apply
@@ -408,7 +409,6 @@ button:
 
 sensor:
   - platform: template
-    id: rssi_dbm
     name: "RSSI"
     unit_of_measurement: "dBm"
     accuracy_decimals: 0
@@ -529,7 +529,6 @@ interval:
           call.perform();
 
 remote_receiver:
-  id: rf_receiver
   pin:
     number: ${pin_rx}
     mode:

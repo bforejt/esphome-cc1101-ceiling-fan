@@ -137,7 +137,7 @@ variant, leave GDO2 unconnected.
 |------|------|
 | `ceiling-fans-stateless.yaml` | The **stateless** variant: two fans (Office, Guest) as repeated button blocks sharing one transmit engine. The minimal reference — also the protocol-provenance record. |
 | `ceiling-fans-stateful.yaml` | The **stateful** variant: native fan + light entities per fan, on-device assumed state, same transmit engine. See [The stateful variant](#the-stateful-variant). |
-| `sniffer.yaml` | **Capture tool / RF bench**, not a bridge: receive-only, with a **web UI** for tuning the radio (frequency, bitrate, bandwidth), switching the log between B99 decode and raw pulses, restarting the radio, and reading RSSI + capture counters. Decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. See [Plan A](#plan-a--let-the-firmware-decode-for-you-recommended). |
+| `sniffer.yaml` | **Capture tool / RF bench**, not a bridge: receive-only, with a **web UI** for tuning the radio (frequency, bitrate, bandwidth, OOK/FSK modulation), switching the log between B99 decode and raw pulses, restarting the radio, and reading RSSI + capture counters. Decodes remote presses off the air and logs `id`/`K`/`cmd`/`cnt` directly. See [Plan A](#plan-a--let-the-firmware-decode-for-you-recommended). |
 
 > Both configs are intentionally **single readable flat files** with some
 > repetition between fans, rather than clever multi-file packages. See
@@ -564,6 +564,7 @@ Home Assistant if you connect it):
 | Control | Purpose |
 |---|---|
 | **Log Mode** | `B99 Decode` (default) or `Raw Pulses` |
+| **Modulation** | `OOK` (default) or `FSK` — selects the demodulator feeding the async data line, applied via the radio's `setOOK()` on Apply. Cheap fan/gate remotes are almost always OOK; FSK is there for hunting an unknown transmitter |
 | **RX Attenuation** | `0 / 6 / 12 / 18 dB` (the CC1101 CLOSE_IN_RX attenuator). More attenuation = less sensitivity = only strong / nearby transmitters slice — raise it to cut a noisy neighborhood's OOK chatter while your own remote (near the antenna) still decodes |
 | **Frequency** | MHz, 5 kHz steps — hunt an off-center remote (cheap SAW transmitters sit 100+ kHz off). Full CC1101 span (300–928); only the 300–348 / 387–464 / 779–928 bands lock (the gaps are dead, and Apply warns). Your module's matching is band-specific — a 433 module hears poorly at 315/868. |
 | **Bitrate** | the CC1101 DRATE register (not the OOK symbol rate). **100 is the proven value**; 10 went completely deaf on known-good hardware |
