@@ -186,7 +186,7 @@ script:
           auto call = id(rf_transmitter).transmit();
           auto *d = call.get_data();
           d->set_carrier_frequency(0);
-          d->reserve(REPEATS * 70 + 8);
+          d->reserve(REPEATS * (1 + 32) * 2);  // per repeat: 1 sync + 32 bits, each item = mark+space
           for (int r = 0; r < REPEATS; r++) {
             d->item(SYNC_H, SYNC_L);
             for (int i = 31; i >= 0; i--) {
@@ -209,6 +209,8 @@ script:
 #   All Off=0x06  Fan Off=0x16  Light(toggle)=0x08  Forward=0x04  Reverse=0x11
 #   Variable=0x15  Speed1=0x10 Speed2=0x12 Speed3=0x1C Speed4=0x0A Speed5=0x0F
 #   Speed6=0x0C   Timer1h=0x02  Timer2h=0x09  Timer4h=0x19
+# The button `data:` values below are the DECIMAL equivalents of these hex
+# codes (e.g. Light 0x08 = 8); tx_send logs them back as hex via 0x%02X.
 # NOTE: Light is the ONLY true toggle in the protocol (no discrete on/off).
 # -----------------------------------------------------------------------------
 button:
