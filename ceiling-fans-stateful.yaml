@@ -245,6 +245,12 @@ api:
     key: !secret esp_433_radio__encryption_key
   reboot_timeout: 0s
 
+# HA time source, used only to stamp "Last TX Time" for the troubleshooting
+# sensors. Piggybacks on the API connection; no extra network config.
+time:
+  - platform: homeassistant
+    id: ha_time
+
 ota:
   - platform: esphome
     on_begin:
@@ -409,6 +415,10 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: '0'
+  - id: tx_total                # HA-visible transmit counter (troubleshooting)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
   # ---- STATUS-LED (2/6, optional) — last accepted RX press (millis). The
   # ---- write in the RX dispatch is harmless if the LED sections are removed.
   - id: rx_last_ms
@@ -481,6 +491,29 @@ script:
           ESP_LOGD("tx_send", "unit=%d id=0x%05X cmd=0x%02X cnt=%u freq=%.2f frame=0x%08X",
                    unit, (unsigned)(id_ & 0xFFFFF), (unsigned)cmd,
                    (unsigned)cnt, freq, (unsigned)frame);
+          // --- HA-visible transmit activity (troubleshooting only; no RF effect) ---
+          id(tx_total) += 1;
+          id(tx_transmits).publish_state((float) id(tx_total));
+          const char *uname = (unit == 0) ? "Office" : (unit == 1) ? "Guest" : "Green";
+          const char *cname =
+              (cmd == 0x06) ? "All Off"  : (cmd == 0x16) ? "Fan Off"  :
+              (cmd == 0x08) ? "Light"    : (cmd == 0x04) ? "Forward"  :
+              (cmd == 0x11) ? "Reverse"  : (cmd == 0x15) ? "Breeze"   :
+              (cmd == 0x10) ? "Speed 1"  : (cmd == 0x12) ? "Speed 2"  :
+              (cmd == 0x1C) ? "Speed 3"  : (cmd == 0x0A) ? "Speed 4"  :
+              (cmd == 0x0F) ? "Speed 5"  : (cmd == 0x0C) ? "Speed 6"  :
+              (cmd == 0x02) ? "Timer 1h" : (cmd == 0x09) ? "Timer 2h" :
+              (cmd == 0x19) ? "Timer 4h" : "cmd";
+          char _txbuf[64];
+          snprintf(_txbuf, sizeof(_txbuf), "%s | %s (0x%02X) | %.2f MHz | #%u",
+                   uname, cname, (unsigned)cmd, freq, (unsigned)cnt);
+          id(last_tx).publish_state(_txbuf);
+          auto _now = id(ha_time).now();
+          if (_now.is_valid()) {
+            char _ts[32];
+            _now.strftime(_ts, sizeof(_ts), "%Y-%m-%dT%H:%M:%S%z");
+            id(last_tx_time).publish_state(_ts);
+          }
       - delay: ${tx_pace}
 
 # -----------------------------------------------------------------------------
@@ -733,6 +766,38 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
+
+# -----------------------------------------------------------------------------
+# TX activity (troubleshooting). Purely observational -- mirrors what tx_send
+# does into Home Assistant so transmit activity is visible without tailing the
+# device logs. Nothing here touches the RF path.
+#   Transmits    : monotonic count; ticks up each time a frame is emitted. A
+#                  dashboard press that does NOT bump it = the reconciler found
+#                  no state diff (idempotent no-op) or the queue overflowed --
+#                  i.e. the command never left the ESP.
+#   Last TX      : most recent frame, decoded (fan, command, freq, counter).
+#   Last TX Time : when the most recent frame went out (HA shows "N min ago").
+# -----------------------------------------------------------------------------
+sensor:
+  - platform: template
+    id: tx_transmits
+    name: "Transmits"
+    icon: mdi:radio-tower
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: never   # event-driven: published by tx_send after each emit
+
+text_sensor:
+  - platform: template
+    id: last_tx
+    name: "Last TX"
+    icon: mdi:remote
+
+  - platform: template
+    id: last_tx_time
+    name: "Last TX Time"
+    device_class: timestamp
+    icon: mdi:clock-outline
 
 # ---- STATUS-LED (5/6, optional) — the painter. Priority order: dark mode >
 # ---- component error (red) > warning (yellow) > wifi down (orange) > RX
