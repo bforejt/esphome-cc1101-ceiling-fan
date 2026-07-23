@@ -15,7 +15,7 @@
 #  in one on_state lambda that diffs the entity's commanded state against the
 #  assumed-physical-state globals and transmits only the differences. This is
 #  order-independent (it doesn't matter what a FanCall bundles), idempotent
-#  (a second pass diffs nothing), and is the exact seam a future RX decoder
+#  (a second pass diffs nothing), and is the exact seam the RX decoder
 #  reuses (RX = update globals + entity under suppress; reconciler sees no
 #  diff). We deliberately do NOT use on_turn_on/on_speed_set/on_direction_set:
 #  their relative firing order for combined calls is not contractually
@@ -26,7 +26,7 @@
 #  on_boot hook (priority -100) pushes flash-restored globals into the
 #  entities (suppressed), then arms transmit as its last statement. The same
 #  guard scopes every programmatic state sync (All Off, invert button, and
-#  future RX) — trigger callbacks run synchronously inside perform(), so a
+#  RX) — trigger callbacks run synchronously inside perform(), so a
 #  set/clear pair inside one lambda brackets them.
 #
 #  ASSUMED STATE — PLEASE NOTE: a transmitter cannot observe the fan. This
@@ -41,7 +41,7 @@
 #    - "All Off" transmits the atomic 0x06 frame and force-syncs fan+light
 #      to off — it IS the manual resync-to-known-state affordance.
 #    - Fan power cycle desyncs everything until the next command. Unavoidable
-#      without RX; RX (roadmap) heals fan state on the next remote press.
+#      without RX; RX heals fan state on the next remote press.
 #    - Direction is ASSERTED on every turn-on as [Speed N, then F/R], ~450ms
 #      apart: the fan does not reliably preserve direction across a restart
 #      (some units power up forward regardless of last direction), so we set
@@ -95,9 +95,10 @@
 #      fan fine but arrives too noisy for consistent decode (the fan's
 #      purpose-built receiver is more forgiving than our CC1101). Register
 #      experiments (RX DRATE 10; DN022 AGC) each went fully deaf and were
-#      reverted — the shipped SmartRC-AGC + DRATE-100 combo is a narrow
-#      working point; do not retune blindly. Carrier-offset measurement via
-#      SDR is the open diagnostic lead.
+#      reverted. The shipped RX runs SmartRC-AGC, now at DRATE 20 + 812 kHz
+#      bandwidth — a deliberate, bench-tested retune for this remote (DRATE 100
+#      was the earlier point); do not retune blindly beyond it. Carrier-offset
+#      measurement via SDR is the open diagnostic lead.
 #    - GOAL & LIMITS: keep the fan controller, the physical remote, and this
 #      ESP in sync where possible. WORK IN PROGRESS — not perfectly reliable:
 #      the protocol is ONE-WAY (the controller never confirms anything), so
@@ -120,6 +121,9 @@ substitutions:
   # at 20kBd that grid is 6.25us, ~2.5% of the 251us short pulse and ~40x inside
   # the receiver's 35% width tolerance -- TX stays bench-proven. CHANBW is a
   # pure receive filter and has no TX effect at all.
+  # NOTE: this RX tuning is INTENTIONALLY different from the stateless bridge
+  # (bitrate 100) and the sniffer (100/464) -- do not "sync" them; each file is
+  # tuned for its own job. See the sniffer to compare tunings at runtime.
   #   rx_bitrate 20  : bench-proven clean decode of a marginal/noisy remote.
   #                    Coarser than 100 (default), so the 6.25us grid debounces
   #                    sub-grid noise jitter the fine 1.25us grid (100kBd) passed
@@ -266,8 +270,9 @@ spi:
 # Transmit on GDO0/GPIO5. The radiolib component keys the CC1101 via the
 # remote_transmitter's on_transmit/on_complete hooks (xmit()/recv()), so the
 # radio returns to RX/idle after each transmit and does NOT hold a band keyed.
-# radio_txing brackets each transmission — the Phase-2 RX handler gates on it
-# to ignore self-echo on the shared pin.
+# radio_txing brackets each transmission — the RX handler gates on it to
+# ignore self-echo (TX keys GDO0/GPIO5, RX listens on GDO2/GPIO6 — separate
+# pins, so the flag is belt-and-braces, not a shared-pin requirement).
 remote_transmitter:
   id: rf_transmitter
   pin:
@@ -477,7 +482,7 @@ script:
 # FAN ENTITIES — one on_state reconciler each (see header). Command map used:
 #   Fan Off=0x16  Forward=0x04  Reverse=0x11  Variable/Breeze=0x15
 #   Speed1..6 = 0x10 0x12 0x1C 0x0A 0x0F 0x0C   (absolute; Speed N is also
-#   the turn-on command — bench-verify item A)
+#   the turn-on command)
 # -----------------------------------------------------------------------------
 fan:
   - platform: template
@@ -490,7 +495,7 @@ fan:
     restore_mode: NO_RESTORE   # globals are the source of truth (see on_boot)
     on_state:
       - lambda: |-
-          if (id(suppress_tx)) return;   // boot restore / All Off / Phase-2 RX sync
+          if (id(suppress_tx)) return;   // boot restore / All Off / RX sync
           auto *f = id(office_fan);
           const bool want_on  = f->state;
           // "Breeze" is the only preset, so any active preset means Breeze.
@@ -785,7 +790,9 @@ interval:
 #     TOGGLE is wrong precisely when state has drifted), then force-sync both
 #     entities to off under the suppress guard. THE resync affordance.
 #   - Light State Invert (diagnostic): no RF; flips the assumed light state
-#     for one-press recovery when the toggle-only light drifts.
+#     for one-press recovery when the toggle-only light drifts. KEEP even
+#     though RX now mirrors light presses: RX only heals on a *decoded* press,
+#     so a missed/undecoded physical press still needs this manual resync.
 # -----------------------------------------------------------------------------
 button:
   # ============================ OFFICE (unit 0) ============================

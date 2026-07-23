@@ -11,8 +11,9 @@ secrets.yaml
 __pycache__/
 .DS_Store
 
-# Claude Code local settings
+# Claude Code local settings + scratch worktrees
 .claude/settings.local.json
+.claude/worktrees/
 
 # Diagnostic log dumps copied in for analysis
 logs*.txt

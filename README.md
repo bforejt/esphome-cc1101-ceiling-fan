@@ -154,7 +154,8 @@ variant, leave GDO2 unconnected.
 
 2. **Capture your remote's ID and K** — see
    [Capturing & decoding](#capturing--decoding-your-remote). You cannot skip this;
-   the values in the repo (`0x003B9`/`K=0xB`, `0x18999`/`K=0xA`) are *our* remotes.
+   the values in the repo (`0x003B9`/`K=0xB`, `0x18999`/`K=0xA`, and `0x01950`/`K=0x7`
+   in the stateful variant's third fan) are *our* remotes.
 
 3. **Edit `substitutions:`** in your chosen [variant](#two-variants):
    ```yaml
@@ -303,10 +304,12 @@ remote, and this ESP — in sync where possible. Please note the limits:
 - **The RF signal must be clean for reliable decode.** The fan's purpose-built
   receiver is far more forgiving than our general-purpose CC1101: most of our
   remotes decode perfectly, while one operates its fan reliably yet arrives
-  too noisy for us to decode consistently. (Register-tuning experiments — RX
-  data rate, DN022 AGC — both made things worse and were reverted; the git
-  history documents them. Carrier-offset measurement via SDR is the open
-  diagnostic lead.)
+  too noisy for us to decode consistently. (*Blind* register experiments —
+  DRATE 10, DN022 AGC — made things worse and were reverted. The one
+  deliberate retune that helped: widening RX bandwidth to 812 kHz and dropping
+  the data rate to 20 kBd, which cleaned up the marginal remote on the bench
+  and now ships on the stateful RX. Carrier-offset measurement via SDR is the
+  open diagnostic lead; the git history documents all of it.)
 - **The protocol is one-way.** The fan controller never acknowledges anything,
   so there is no confirmation that a command — ours or the remote's — was
   actually acted on. Sync drift cannot be *prevented*, only reduced and
@@ -338,8 +341,8 @@ turn-on (as speed-then-direction, ~450 ms apart). This is deliberate: any
 command — F/R included — **starts a stopped fan** (verified), so transmitting
 the direction change immediately would surprise-start it.
 
-**Bench status:** working with both of our fans in normal use — TX control and
-RX mirroring (with the clean-signal remote) validated. Also verified: **any
+**Bench status:** working with all three of our fans in normal use — TX control
+and RX mirroring (with the clean-signal remotes) validated. Also verified: **any
 command (speeds, F/R) starts a stopped fan**, and the controller **remembers
 its last speed and direction across a stop** — the same memory model this
 firmware's state globals use. Still open: reliable decode of the noisier
@@ -553,10 +556,12 @@ Either config decodes B99 frames off the air and hands you the values:
 
 #### The sniffer
 
-`sniffer.yaml` is receive-only and reuses the **exact receive chain the
-stateful variant decodes three fans with in production** — RadioLib, bitrate
-100, stock AGC, RX on GDO2 → GPIO6. It never transmits, so it can also read
-GDO0 by setting `pin_rx: "5"`.
+`sniffer.yaml` is receive-only and reuses the **same RadioLib receive topology
+the stateful variant decodes three fans with in production** — stock AGC, RX on
+GDO2 → GPIO6. It defaults to bitrate 100 / 464 kHz, whereas the stateful RX now
+runs 20 kBd / 812 kHz for a marginal remote — both reachable at runtime from the
+sniffer's web UI. It never transmits, so it can also read GDO0 by setting
+`pin_rx: "5"`.
 
 Everything is managed from the device's own **web page** (and mirrored into
 Home Assistant if you connect it):
@@ -741,9 +746,11 @@ to be in RF range of our house, please don't.
 - **RX state-tracking: shipped in the stateful variant** (GDO2 → GPIO6), a
   **work in progress**. Wall-remote presses update the entities live in HA;
   unknown remotes are discoverable from the logs (`rx_discover`). Open items:
-  reliable decode needs a **clean signal** — one of our two remotes still
+  reliable decode needs a **clean signal** — one of our remotes still
   arrives too noisy (carrier-offset measurement via SDR is the next
-  diagnostic; blind register tuning has been tried and reverted) — and the
+  diagnostic; the stateful RX widens bandwidth to 812 kHz and drops the data
+  rate to 20 kBd for it, while blind DRATE/AGC tuning was tried and reverted)
+  — and the
   one-way protocol means sync drift can never be fully eliminated, only
   repaired. The radio parks in RX between transmits so it doesn't hold a band
   keyed.
@@ -767,7 +774,7 @@ to be in RF range of our house, please don't.
 - The sync header is required; ≥4000 µs gap works, 3750 µs fails (our unit).
 - The 32-bit frame layout, bit timings, and checksum formula (verified against
   many captures decoding self-consistently).
-- Our two remotes' IDs and K values.
+- Our three remotes' IDs and K values.
 - The stateful variant's RX path: IOCFG2-routed data on GDO2 → GPIO6 +
   `remote_receiver` decodes a clean-signal remote and mirrors its presses into
   the entities, live in HA, alongside working transmit.
@@ -775,8 +782,11 @@ to be in RF range of our house, please don't.
   controller remembers its last speed and direction across a stop — matching
   this firmware's state model.
 - Turning RX registers blindly breaks reception: DRATE 10 (with stock AGC) and
-  DN022 AGC values (with DRATE 100) each went completely deaf — both reverted;
-  the shipped SmartRC-AGC + DRATE-100 combination is a narrow working point.
+  DN022 AGC values (with DRATE 100) each went completely deaf — both reverted.
+  What works is the stock SmartRC AGC; the stateful RX now runs it at DRATE 20
+  with 812 kHz bandwidth — a deliberate, bench-tested retune for the marginal
+  remote (DRATE 100 was the earlier working point). Blind single-register
+  changes remain the trap.
 - **Suspect the hardware before the registers.** A second CC1101 module was
   simply faulty: it passed its SPI chip-ID check, reported RSSI, and emitted
   demodulator noise on its GDO pins, yet never decoded a real transmission on
@@ -793,8 +803,8 @@ to be in RF range of our house, please don't.
 **Unknown / not tested:**
 - Whether the fan validates the rolling counter or ignores it (we kept per-fan
   counters for fidelity regardless).
-- Why one of our two remotes decodes cleanly and the other doesn't, despite
-  both operating their fans reliably (carrier offset is the leading suspect —
+- Why one of our remotes decodes marginally while the others decode cleanly,
+  despite all operating their fans reliably (carrier offset is the leading suspect —
   unmeasured; the fans' purpose-built receivers are simply more forgiving than
   our CC1101).
 - Which mode a stopped fan resumes in when it was last in Breeze (the firmware
