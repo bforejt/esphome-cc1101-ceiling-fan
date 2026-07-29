@@ -104,7 +104,12 @@
 #      the protocol is ONE-WAY (the controller never confirms anything), so
 #      drift can only be reduced and repaired (All Off, Light State Invert),
 #      never fully prevented. The radio is also deaf during its own ~400ms
-#      transmits; a remote press in that window is missed.
+#      transmits; a remote press in that window is missed. ESP state is the
+#      SOURCE OF TRUTH: whenever a unit's target end-state is all-off, the
+#      reconciler/light handlers substitute All Off (0x06) for Fan Off /
+#      the light toggle -- the one command that forces the light off
+#      deterministically -- asserting the model onto the hardware (and, by
+#      deliberate choice, stopping a fan the model didn't know was running).
 # #############################################################################
 
 substitutions:
@@ -548,7 +553,14 @@ fan:
           //    to the next turn-on; see header)
           if (!want_on) {
             if (id(office_fan_on)) {
-              id(tx_send).execute(0, ${office_id_dec}, ${office_k}, 0x16, ${office_freq_mhz});
+              // Light also assumed off -> All Off (0x06) instead of Fan Off
+              // (0x16). Same fan effect, but 0x06 also FORCES the light off --
+              // the protocol's only deterministic light-off (0x08 is a toggle)
+              // -- healing a light that drifted physically-on unnoticed. ESP
+              // state is the source of truth; end-state all-off is asserted
+              // with the one command that guarantees it.
+              const uint8_t off_cmd = id(office_light_on) ? 0x16 : 0x06;
+              id(tx_send).execute(0, ${office_id_dec}, ${office_k}, off_cmd, ${office_freq_mhz});
               id(office_fan_on) = false;
               id(office_fan_breeze) = false;   // fan stop clears breeze physically
             }
@@ -603,7 +615,9 @@ fan:
 
           if (!want_on) {
             if (id(guest_fan_on)) {
-              id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, 0x16, ${guest_freq_mhz});
+              // light also assumed off -> All Off (see office reconciler)
+              const uint8_t off_cmd = id(guest_light_on) ? 0x16 : 0x06;
+              id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, off_cmd, ${guest_freq_mhz});
               id(guest_fan_on) = false;
               id(guest_fan_breeze) = false;
             }
@@ -651,7 +665,9 @@ fan:
 
           if (!want_on) {
             if (id(green_fan_on)) {
-              id(tx_send).execute(2, ${green_id_dec}, ${green_k}, 0x16, ${green_freq_mhz});
+              // light also assumed off -> All Off (see office reconciler)
+              const uint8_t off_cmd = id(green_light_on) ? 0x16 : 0x06;
+              id(tx_send).execute(2, ${green_id_dec}, ${green_k}, off_cmd, ${green_freq_mhz});
               id(green_fan_on) = false;
               id(green_fan_breeze) = false;
             }
@@ -690,7 +706,18 @@ output:
       - lambda: |-
           if (id(suppress_tx)) return;              // boot restore / All Off / invert / RX sync
           if (state == id(office_light_on)) return; // already there — no RF
-          id(tx_send).execute(0, ${office_id_dec}, ${office_k}, 0x08, ${office_freq_mhz});
+          // Turning the light OFF while the fan is assumed off -> All Off
+          // (0x06) instead of the 0x08 toggle. 0x06 forces the light off even
+          // if the assumption had inverted (a toggle would turn it ON), and
+          // re-asserts fan-off. DELIBERATE trade-off: ESP state is the source
+          // of truth -- if a missed remote press left the fan secretly
+          // running, this stops it (converge reality to the model) rather
+          // than preserving an untracked fan.
+          if (!state && !id(office_fan_on)) {
+            id(tx_send).execute(0, ${office_id_dec}, ${office_k}, 0x06, ${office_freq_mhz});
+          } else {
+            id(tx_send).execute(0, ${office_id_dec}, ${office_k}, 0x08, ${office_freq_mhz});
+          }
           id(office_light_on) = state;
   - platform: template
     id: guest_light_out
@@ -699,7 +726,12 @@ output:
       - lambda: |-
           if (id(suppress_tx)) return;
           if (state == id(guest_light_on)) return;
-          id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, 0x08, ${guest_freq_mhz});
+          // light-off + fan assumed off -> All Off (see office_light_out)
+          if (!state && !id(guest_fan_on)) {
+            id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, 0x06, ${guest_freq_mhz});
+          } else {
+            id(tx_send).execute(1, ${guest_id_dec}, ${guest_k}, 0x08, ${guest_freq_mhz});
+          }
           id(guest_light_on) = state;
   - platform: template
     id: green_light_out
@@ -708,7 +740,12 @@ output:
       - lambda: |-
           if (id(suppress_tx)) return;
           if (state == id(green_light_on)) return;
-          id(tx_send).execute(2, ${green_id_dec}, ${green_k}, 0x08, ${green_freq_mhz});
+          // light-off + fan assumed off -> All Off (see office_light_out)
+          if (!state && !id(green_fan_on)) {
+            id(tx_send).execute(2, ${green_id_dec}, ${green_k}, 0x06, ${green_freq_mhz});
+          } else {
+            id(tx_send).execute(2, ${green_id_dec}, ${green_k}, 0x08, ${green_freq_mhz});
+          }
           id(green_light_on) = state;
 
 light:
